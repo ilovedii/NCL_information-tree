@@ -1,0 +1,51 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Python virtual environments
+# =========================
+.venv/
+venv/
+
+# 如果你的 ncl 虛擬環境「真的在 chunking/ncl/ 裡面」
+# 才需要保留下面這行
+ncl/
+
+# =========================
+# Secrets / environment variables
+# =========================
+.env
+.env.*
+*.key
+*.pem
+
+# =========================
+# VS Code
+# =========================
+.vscode/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Python / tool cache
+# =========================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# 你的 retrieval 執行快取
+retrieval/cache/
+
+# =========================
+# Logs
+# =========================
+*.log
