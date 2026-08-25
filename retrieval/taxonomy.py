@@ -158,6 +158,71 @@ class TaxonomyIndex:
             "taxonomy_paths": str(self.df.at[idx, "taxonomy_paths"]) if "taxonomy_paths" in self.df.columns else "",
         }
 
+    def indices_for_atomic_ids(self, atomic_ids):
+        """Return dataframe indices that match the supplied atomic IDs."""
+        atomic_ids = {
+            str(value).strip()
+            for value in atomic_ids
+            if str(value).strip()
+        }
+        if not atomic_ids:
+            return []
+
+        atomic_series = self.df["atomic_id"].astype(str).str.strip()
+        return self.df.index[atomic_series.isin(atomic_ids)].tolist()
+
+    def sibling_indices_for_atomic_ids(
+        self,
+        atomic_ids,
+        max_faqs=3,
+        max_siblings_per_faq=15,
+    ):
+        """
+        Expand retrieved atomic units through their original FAQ provenance.
+
+        The taxonomy path is not changed. This method only follows the
+        source relation: atomic_id -> faq_id -> other atomic units from the
+        same original FAQ.
+        """
+        if "faq_id" not in self.df.columns:
+            return []
+
+        anchor_indices = self.indices_for_atomic_ids(atomic_ids)
+        if not anchor_indices:
+            return []
+
+        faq_ids = []
+        seen_faqs = set()
+        for idx in anchor_indices:
+            faq_id = str(self.df.at[idx, "faq_id"]).strip()
+            if not faq_id or faq_id in seen_faqs:
+                continue
+            seen_faqs.add(faq_id)
+            faq_ids.append(faq_id)
+            if len(faq_ids) >= max_faqs:
+                break
+
+        if not faq_ids:
+            return []
+
+        faq_series = self.df["faq_id"].astype(str).str.strip()
+        result = []
+        seen_indices = set()
+
+        for faq_id in faq_ids:
+            sibling_indices = self.df.index[faq_series == faq_id].tolist()
+            if max_siblings_per_faq and max_siblings_per_faq > 0:
+                sibling_indices = sibling_indices[:max_siblings_per_faq]
+
+            for idx in sibling_indices:
+                idx = int(idx)
+                if idx in seen_indices:
+                    continue
+                seen_indices.add(idx)
+                result.append(idx)
+
+        return result
+
     def documents_for_indices(self, indices, date_column="question_date"):
         ordered = self.sort_indices_by_date(indices, date_column=date_column)
         return [self.document_record(idx) for idx in ordered]

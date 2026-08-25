@@ -136,6 +136,100 @@ class TreeGuidedRAG:
             "source_coverage_ratio": 1.0 if units else 0.0,
         }
 
+    def _faq_family_summary(self, prioritized_evidence):
+        """Expand direct evidence to atomic siblings from the same original FAQ.
+
+        This is a deterministic provenance lookup, not another taxonomy-routing step.
+        The expanded units are returned as a summary-like bundle so the existing
+        EvidenceSelector can re-rank them against the current user query.
+        """
+        anchor_ids = []
+        seen_anchor_ids = set()
+        direct_count = 0
+
+        for item in prioritized_evidence:
+            if item.get("utility") != "direct":
+                continue
+
+            direct_count += 1
+            for source_id in item.get("source_ids", []):
+                atomic_id = str(source_id).strip()
+                if atomic_id and atomic_id not in seen_anchor_ids:
+                    seen_anchor_ids.add(atomic_id)
+                    anchor_ids.append(atomic_id)
+
+            if direct_count >= self.config.max_anchor_evidence:
+                break
+
+        if not anchor_ids:
+            return None
+
+        sibling_indices = self.taxonomy.sibling_indices_for_atomic_ids(
+            anchor_ids,
+            max_faqs=self.config.max_anchor_faqs,
+            max_siblings_per_faq=self.config.max_siblings_per_faq,
+        )
+        if not sibling_indices:
+            return None
+
+        existing_source_ids = {
+            str(source_id).strip()
+            for item in prioritized_evidence
+            for source_id in item.get("source_ids", [])
+            if str(source_id).strip()
+        }
+
+        units = []
+        expanded_source_ids = []
+        expanded_faq_ids = []
+        seen_faq_ids = set()
+
+        for idx in sibling_indices:
+            record = self.taxonomy.document_record(idx)
+            atomic_id = str(record["atomic_id"]).strip()
+            faq_id = str(record.get("faq_id", "")).strip()
+
+            if not atomic_id or atomic_id in existing_source_ids:
+                continue
+
+            units.append(
+                {
+                    "knowledge_id": f"FAQ{len(units) + 1:03d}",
+                    "type": "related_source",
+                    "content": f"Q：{record['question']}\nA：{record['answer']}",
+                    "time_scope": record["question_date"],
+                    "source_ids": [atomic_id],
+                }
+            )
+            expanded_source_ids.append(atomic_id)
+            if faq_id and faq_id not in seen_faq_ids:
+                seen_faq_ids.add(faq_id)
+                expanded_faq_ids.append(faq_id)
+
+        if not units:
+            return None
+
+        return {
+            "fingerprint": "faq_family_expansion",
+            "cache_hit": False,
+            "role": "faq_family",
+            "level": "FAQ",
+            "path": "Related Original FAQ",
+            "document_count": len(units),
+            "date_start": "",
+            "date_end": "",
+            "all_source_ids": expanded_source_ids,
+            "knowledge_units": units,
+            "coverage_note": (
+                "根據 direct evidence 的原始 faq_id，補回同一原始問答中"
+                "被 atomic decomposition 拆開、但目前 Tree 節點未取回的知識。"
+            ),
+            "source_coverage_ratio": 1.0,
+            "anchor_source_ids": anchor_ids,
+            "expanded_faq_ids": expanded_faq_ids,
+            "expanded_source_ids": expanded_source_ids,
+        }
+
     def _answer(self, query, context_pack):
         system = """你是國家圖書館領域的最終問答模型。請只依提供的正式 taxonomy、分類路徑與節點知識摘要回答。Knowledge Units 已由 Evidence Prioritizer 標示 direct、supporting、background、low_relevance；請優先依 direct 與 supporting 作答，但在需要判斷例外、時間演變、版本差異或衝突時，必須檢查其他單元。若知識沒有直接答案，可以在已提供規則之間做保守歸納並清楚標示推論。若仍不足，明確指出缺少什麼知識，不得虛構。回答時保留支持結論的 atomic_id。"""
         user = f"""請回答以下問題：
@@ -212,6 +306,16 @@ class TreeGuidedRAG:
         if fallback is not None:
             summaries.append(fallback)
         prioritized_evidence = self.evidence_selector.prioritize(query, summaries)
+
+        faq_family = None
+        if self.config.use_faq_expansion:
+            faq_family = self._faq_family_summary(prioritized_evidence)
+            if faq_family is not None:
+                summaries.append(faq_family)
+                # Re-run relevance reasoning because same-FAQ siblings are candidates,
+                # not automatically valid answers to the current query.
+                prioritized_evidence = self.evidence_selector.prioritize(query, summaries)
+
         all_prioritized_count = len(prioritized_evidence)
         if final_context_unit_limit and final_context_unit_limit > 0:
             prioritized_evidence = prioritized_evidence[:final_context_unit_limit]
@@ -247,6 +351,16 @@ class TreeGuidedRAG:
                 for summary in summaries
             ],
             "evidence": prioritized_evidence,
+            "faq_expansion": (
+                {
+                    "triggered": True,
+                    "anchor_source_ids": faq_family.get("anchor_source_ids", []),
+                    "expanded_faq_ids": faq_family.get("expanded_faq_ids", []),
+                    "expanded_source_ids": faq_family.get("expanded_source_ids", []),
+                }
+                if faq_family is not None
+                else {"triggered": False}
+            ),
             "evidence_total_before_context_limit": all_prioritized_count,
             "context_pack": context_pack,
             "answer": answer,
