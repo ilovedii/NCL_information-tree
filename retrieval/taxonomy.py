@@ -159,17 +159,28 @@ class TaxonomyIndex:
         }
 
     def indices_for_atomic_ids(self, atomic_ids):
-        """Return dataframe indices that match the supplied atomic IDs."""
-        atomic_ids = {
-            str(value).strip()
-            for value in atomic_ids
-            if str(value).strip()
-        }
-        if not atomic_ids:
+        """Return matching dataframe indices while preserving input evidence order."""
+        ordered_ids = []
+        seen_ids = set()
+        for value in atomic_ids:
+            atomic_id = str(value).strip()
+            if not atomic_id or atomic_id in seen_ids:
+                continue
+            seen_ids.add(atomic_id)
+            ordered_ids.append(atomic_id)
+
+        if not ordered_ids:
             return []
 
         atomic_series = self.df["atomic_id"].astype(str).str.strip()
-        return self.df.index[atomic_series.isin(atomic_ids)].tolist()
+        index_by_atomic_id = defaultdict(list)
+        for idx, atomic_id in atomic_series.items():
+            index_by_atomic_id[atomic_id].append(int(idx))
+
+        result = []
+        for atomic_id in ordered_ids:
+            result.extend(index_by_atomic_id.get(atomic_id, []))
+        return result
 
     def sibling_indices_for_atomic_ids(
         self,

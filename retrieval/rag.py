@@ -2,7 +2,7 @@ from context_builder import ContextBuilder
 from evidence_selector import EvidenceSelector
 from knowledge_loader import KnowledgeLoader
 from knowledge_summarizer import KnowledgeSummarizer
-from llm_client import OllamaClient
+from llm_client import OllamaClient, OpenAICompatibleClient
 from retriever import HybridRetriever
 from router import TreeRouter
 from taxonomy import TaxonomyIndex
@@ -20,12 +20,37 @@ class TreeGuidedRAG:
     ):
         self.config = config
         self.taxonomy = TaxonomyIndex(config.csv_path)
-        default_llm = OllamaClient(config.ollama_url, timeout=config.timeout)
-        self.router_llm = router_llm or default_llm
-        self.summarizer_llm = summarizer_llm or default_llm
-        self.evidence_llm = evidence_llm or default_llm
-        self.answer_llm = answer_llm or default_llm
-        self.embedding_llm = embedding_llm or default_llm
+
+        # Keep two independent clients:
+        # - NCL OpenAI-compatible API for generation/reasoning
+        # - local Ollama for embedding fallback
+        ollama_client = OllamaClient(
+            config.ollama_url,
+            timeout=config.timeout,
+        )
+        ncl_client = OpenAICompatibleClient(
+            config.ncl_api_url,
+            timeout=config.timeout,
+            verify_ssl=config.ncl_verify_ssl,
+        )
+
+        def generation_client(provider):
+            provider = str(provider).strip().lower()
+            if provider == "ncl":
+                return ncl_client
+            if provider == "ollama":
+                return ollama_client
+            raise ValueError(
+                f"未知 LLM provider: {provider!r}；目前只支援 'ncl' 或 'ollama'"
+            )
+
+        self.router_llm = router_llm or generation_client(config.router_provider)
+        self.summarizer_llm = summarizer_llm or generation_client(config.summarizer_provider)
+        self.evidence_llm = evidence_llm or generation_client(config.evidence_provider)
+        self.answer_llm = answer_llm or generation_client(config.answer_provider)
+
+        # Embedding intentionally stays on local Ollama.
+        self.embedding_llm = embedding_llm or ollama_client
         self.router = TreeRouter(
             self.taxonomy,
             self.router_llm,
