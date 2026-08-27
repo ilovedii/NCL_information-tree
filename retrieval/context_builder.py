@@ -8,7 +8,8 @@ class ContextBuilder:
             lines.append(f"路徑 {i}：{path.display()} | path_score={path.score:.4f}")
             for step in path.trace:
                 lines.append(
-                    f"  {step['level']}：{self.taxonomy.node_label(step['node'])} | score={step['score']:.3f} | {step['reason']}"
+                    f"  {step['level']}：{self.taxonomy.node_label(step['node'])} | "
+                    f"score={step['score']:.3f} | {step['reason']}"
                 )
         return "\n".join(lines)
 
@@ -23,19 +24,20 @@ class ContextBuilder:
                 cards.append(card)
         return "\n\n".join(cards)
 
-    def _summary_text(self, summaries):
+    def _knowledge_pack_text(self, knowledge_packs):
         blocks = []
-        for summary in summaries:
+        for pack in knowledge_packs:
             blocks.append(
                 "\n".join(
                     [
-                        f"role={summary.get('role', 'node')}",
-                        f"path={summary.get('path', '')}",
-                        f"documents={summary.get('document_count', 0)}",
-                        f"date_range={summary.get('date_start', '')} ~ {summary.get('date_end', '')}",
-                        f"knowledge_units={len(summary.get('knowledge_units', []))}",
-                        f"source_coverage_ratio={summary.get('source_coverage_ratio', 0.0):.3f}",
-                        f"coverage_note={summary.get('coverage_note', '')}",
+                        f"role={pack.get('role', 'node')}",
+                        f"path={pack.get('path', '')}",
+                        f"source={pack.get('static_source', 'runtime')}",
+                        f"documents={pack.get('document_count', 0)}",
+                        f"date_range={pack.get('date_start', '')} ~ {pack.get('date_end', '')}",
+                        f"knowledge_units={len(pack.get('knowledge_units', []))}",
+                        f"source_coverage_ratio={pack.get('source_coverage_ratio', 0.0):.3f}",
+                        f"coverage_note={pack.get('coverage_note', '')}",
                     ]
                 )
             )
@@ -47,7 +49,8 @@ class ContextBuilder:
             blocks.append(
                 "\n".join(
                     [
-                        f"[{item['evidence_id']}] utility={item.get('utility', 'background')} score={item.get('score', 0.0):.3f}",
+                        f"[{item['evidence_id']}] utility={item.get('utility', 'background')} "
+                        f"score={item.get('score', 0.0):.3f}",
                         f"role={item.get('role', 'node')}",
                         f"path={item.get('path', '')}",
                         f"knowledge_id={item.get('knowledge_id', '')}",
@@ -61,7 +64,7 @@ class ContextBuilder:
             )
         return "\n\n".join(blocks)
 
-    def build(self, query, paths, summaries, prioritized_evidence):
+    def build(self, query, paths, knowledge_packs, prioritized_evidence):
         return f"""使用者問題
 {query}
 
@@ -71,9 +74,9 @@ class ContextBuilder:
 正式 Taxonomy 節點資訊
 {self._cards_text(paths)}
 
-節點知識摘要概況
-{self._summary_text(summaries)}
+節點靜態知識概況
+{self._knowledge_pack_text(knowledge_packs)}
 
-依 Evidence Prioritizer 排序的完整 Knowledge Units
+最終回答 Context（已過濾；預設僅保留 direct / supporting）
 {self._evidence_text(prioritized_evidence)}
 """
