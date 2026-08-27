@@ -103,7 +103,7 @@ class HybridRetriever:
         for start in range(0, total, self.batch_size):
             end = min(start + self.batch_size, total)
             print(f"建立 Ollama embedding index：{end}/{total}", file=sys.stderr)
-            vectors = self.llm.embed(self.embedding_model, texts[start:end])
+            vectors = self.llm.embed(self.embedding_model, texts[start:end], input_type="passage",)
             batches.append(vectors)
         matrix = np.vstack(batches).astype(np.float32)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
@@ -118,8 +118,18 @@ class HybridRetriever:
 
     def query_embedding(self, query):
         self.ensure_embeddings()
-        vector = self.llm.embed(self.embedding_model, [query])[0].astype(np.float32)
-        vector = vector / max(float(np.linalg.norm(vector)), 1e-12)
+
+        vector = self.llm.embed(
+            self.embedding_model,
+            [query],
+            input_type="query",
+        )[0].astype(np.float32)
+
+        vector = vector / max(
+            float(np.linalg.norm(vector)),
+            1e-12,
+        )
+
         return vector
 
     def search(self, query, indices, top_k=8, query_vector=None):

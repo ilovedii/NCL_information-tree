@@ -1,4 +1,6 @@
 from collections import Counter
+from datetime import datetime
+import re
 
 
 class EvidenceSelector:
@@ -28,6 +30,7 @@ class EvidenceSelector:
         think=True,
         batch_size=40,
         min_supporting_without_direct=2,
+        enable_conflict_analysis=True,
     ):
         self.llm = llm
         self.model = model
@@ -37,6 +40,7 @@ class EvidenceSelector:
             1,
             int(min_supporting_without_direct),
         )
+        self.enable_conflict_analysis = bool(enable_conflict_analysis)
         self.reset_stats()
 
     def reset_stats(self):
@@ -323,48 +327,211 @@ Knowledge Units：
             Counter(item.get("utility", "unknown") for item in evidence or [])
         )
 
-    def check_sufficiency(self, query, evidence):
-        """Judge whether currently relevant evidence covers the whole query.
+    @staticmethod
+    def _is_rule_sensitive_query(query):
+        """Conservative detector for exact cataloguing-rule questions.
 
-        The checker accepts compositional coverage: if separate evidence items
-        directly establish A=X and B=Y, that can be sufficient for a basic
-        "A 與 B 有何不同" question. It must not, however, invent operational
-        differences that the evidence does not establish.
+        This is intentionally deterministic. It does not decide the answer; it
+        only tells the final-answer layer that unsupported analogy must not be
+        promoted into a formal MARC/RDA/classification rule.
+        """
+        text = str(query or "")
+        patterns = [
+            r"\bMARC\s*21\b",
+            r"\bCMARC\b",
+            r"\bRDA\b",
+            r"\bAACR2?\b",
+            r"\bLeader\b|\bLDR\b",
+            r"\b00[15678]\b",
+            r"\b\d{3}\b",
+            r"\$[0-9A-Za-z]",
+            r"subfield",
+            r"欄位|字段|分欄|子欄位|指標|位址|代碼|著錄規則|編目規則|分類號|作者號|主題標目|複分",
+        ]
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+    @staticmethod
+    def _parse_evidence_date(value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        candidates = [text, text[:10]]
+        for candidate in candidates:
+            try:
+                return datetime.fromisoformat(candidate).date()
+            except ValueError:
+                pass
+        for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y%m%d", "%Y/%m", "%Y-%m"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def _resolve_conflict_groups(self, groups, relevant):
+        """Resolve only true same-scope conflicts, using date first.
+
+        LLM decides semantic relationship. Python does the temporal resolution.
+        If any member lacks a usable date or newest date is tied, the conflict is
+        left unresolved for librarian review. Nothing is deleted from evidence.
+        """
+        evidence_by_id = {
+            str(item.get("evidence_id", "")): item
+            for item in relevant or []
+        }
+        normalized = []
+        unresolved = []
+        resolved = []
+
+        for group in groups or []:
+            relationship = str(group.get("relationship", "unknown")).strip()
+            same_scope = bool(group.get("same_scope", False))
+            ids = []
+            for eid in group.get("evidence_ids", []):
+                eid = str(eid).strip()
+                if eid in evidence_by_id and eid not in ids:
+                    ids.append(eid)
+            if len(ids) < 2:
+                continue
+
+            entry = {
+                "evidence_ids": ids,
+                "relationship": relationship,
+                "same_scope": same_scope,
+                "reason": str(group.get("reason", "")).strip(),
+                "resolution_status": "not_applicable",
+                "resolution_method": "none",
+                "preferred_evidence_ids": [],
+                "superseded_evidence_ids": [],
+            }
+
+            if relationship == "conflict" and same_scope:
+                dated = []
+                all_dates_present = True
+                for eid in ids:
+                    date_value = self._parse_evidence_date(
+                        evidence_by_id[eid].get("time_scope", "")
+                    )
+                    if date_value is None:
+                        all_dates_present = False
+                    dated.append((eid, date_value))
+
+                if all_dates_present:
+                    newest = max(date_value for _, date_value in dated)
+                    newest_ids = [eid for eid, date_value in dated if date_value == newest]
+                    if len(newest_ids) == 1:
+                        preferred = newest_ids[0]
+                        entry.update(
+                            {
+                                "resolution_status": "resolved",
+                                "resolution_method": "latest_question_date",
+                                "preferred_evidence_ids": [preferred],
+                                "superseded_evidence_ids": [
+                                    eid for eid in ids if eid != preferred
+                                ],
+                            }
+                        )
+                        resolved.append(entry)
+                    else:
+                        entry.update(
+                            {
+                                "resolution_status": "unresolved",
+                                "resolution_method": "date_tie",
+                            }
+                        )
+                        unresolved.append(entry)
+                else:
+                    entry.update(
+                        {
+                            "resolution_status": "unresolved",
+                            "resolution_method": "missing_date_metadata",
+                        }
+                    )
+                    unresolved.append(entry)
+
+            normalized.append(entry)
+
+        if unresolved:
+            status = "unresolved"
+        elif resolved:
+            status = "resolved_by_date"
+        else:
+            status = "none"
+
+        return {
+            "status": status,
+            "groups": normalized,
+            "resolved_groups": resolved,
+            "unresolved_groups": unresolved,
+            "preferred_evidence_ids": [
+                eid
+                for group in resolved
+                for eid in group.get("preferred_evidence_ids", [])
+            ],
+            "superseded_evidence_ids": [
+                eid
+                for group in resolved
+                for eid in group.get("superseded_evidence_ids", [])
+            ],
+        }
+
+    def _insufficient_result(self, reason, missing, relevant, direct, rule_sensitive):
+        return {
+            "sufficient": False,
+            "query_aspects": [],
+            "covered_aspects": [],
+            "missing_aspects": list(missing),
+            "reason": reason,
+            "relevant_evidence_count": len(relevant),
+            "direct_evidence_count": len(direct),
+            "checked_by_llm": False,
+            "rule_sensitive": bool(rule_sensitive),
+            "coverage_mode": "insufficient",
+            "evidence_relationship": "unknown",
+            "conflict_detected": False,
+            "conflict_resolution": {
+                "status": "none",
+                "groups": [],
+                "resolved_groups": [],
+                "unresolved_groups": [],
+                "preferred_evidence_ids": [],
+                "superseded_evidence_ids": [],
+            },
+        }
+
+    def check_sufficiency(self, query, evidence):
+        """Judge full-query coverage and classify evidence relationships.
+
+        Conflict analysis is folded into this same LLM call. The LLM only
+        classifies semantic relationships; Python resolves true same-scope
+        conflicts by question_date, keeping unresolved conflicts for librarians.
         """
         relevant = self.filter_for_context(evidence, include_background=False)
         direct = [item for item in relevant if item.get("utility") == "direct"]
         supporting = [
             item for item in relevant if item.get("utility") == "supporting"
         ]
+        rule_sensitive = self._is_rule_sensitive_query(query)
 
         if not relevant:
             self._sufficiency_deterministic_skips += 1
-            return {
-                "sufficient": False,
-                "query_aspects": [],
-                "covered_aspects": [],
-                "missing_aspects": ["目前尚未找到可支持核心答案的 evidence"],
-                "reason": "目前沒有 direct/supporting evidence，因此繼續擴張搜尋。",
-                "relevant_evidence_count": 0,
-                "direct_evidence_count": 0,
-                "checked_by_llm": False,
-            }
+            return self._insufficient_result(
+                "目前沒有 direct/supporting evidence，因此繼續擴張搜尋。",
+                ["目前尚未找到可支持核心答案的 evidence"],
+                relevant,
+                direct,
+                rule_sensitive,
+            )
 
         if not direct and len(supporting) < self.min_supporting_without_direct:
             self._sufficiency_deterministic_skips += 1
-            return {
-                "sufficient": False,
-                "query_aspects": [],
-                "covered_aspects": [],
-                "missing_aspects": ["目前證據仍不足以完整支持核心答案"],
-                "reason": (
-                    "尚無 direct evidence，且 supporting evidence 數量不足，"
-                    "先繼續 progressive expansion。"
-                ),
-                "relevant_evidence_count": len(relevant),
-                "direct_evidence_count": 0,
-                "checked_by_llm": False,
-            }
+            return self._insufficient_result(
+                "尚無 direct evidence，且 supporting evidence 數量不足，先繼續 progressive expansion。",
+                ["目前證據仍不足以完整支持核心答案"],
+                relevant,
+                direct,
+                rule_sensitive,
+            )
 
         ids = [item["evidence_id"] for item in relevant]
         blocks = []
@@ -372,11 +539,19 @@ Knowledge Units：
             blocks.append(
                 f"[{item['evidence_id']}] utility={item.get('utility')} "
                 f"score={float(item.get('score', 0.0)):.3f} "
-                f"role={item.get('role')} path={item.get('path')}\n"
+                f"role={item.get('role')} path={item.get('path')} "
+                f"date={item.get('time_scope', '')}\n"
                 f"{item.get('content', '')}\n"
                 f"sources={','.join(item.get('source_ids', []))}"
             )
 
+        relationship_values = [
+            "compatible",
+            "complementary",
+            "conditional",
+            "conflict",
+            "unknown",
+        ]
         schema = {
             "type": "object",
             "properties": {
@@ -394,10 +569,7 @@ Knowledge Units：
                             "aspect": {"type": "string"},
                             "evidence_ids": {
                                 "type": "array",
-                                "items": {
-                                    "type": "string",
-                                    "enum": ids,
-                                },
+                                "items": {"type": "string", "enum": ids},
                             },
                         },
                         "required": ["aspect", "evidence_ids"],
@@ -408,6 +580,40 @@ Knowledge Units：
                     "items": {"type": "string"},
                 },
                 "sufficient": {"type": "boolean"},
+                "coverage_mode": {
+                    "type": "string",
+                    "enum": ["evidence_grounded", "compositional", "insufficient"],
+                },
+                "evidence_relationship": {
+                    "type": "string",
+                    "enum": relationship_values,
+                },
+                "conflict_groups": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "evidence_ids": {
+                                "type": "array",
+                                "minItems": 2,
+                                "items": {"type": "string", "enum": ids},
+                            },
+                            "relationship": {
+                                "type": "string",
+                                "enum": relationship_values,
+                            },
+                            "same_scope": {"type": "boolean"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "evidence_ids",
+                            "relationship",
+                            "same_scope",
+                            "reason",
+                        ],
+                    },
+                },
                 "reason": {"type": "string"},
             },
             "required": [
@@ -415,11 +621,20 @@ Knowledge Units：
                 "covered_aspects",
                 "missing_aspects",
                 "sufficient",
+                "coverage_mode",
+                "evidence_relationship",
+                "conflict_groups",
                 "reason",
             ],
         }
 
-        prompt = f"""你是 Evidence Sufficiency Checker。你的工作不是重新排序 evidence，而是判斷目前已篩出的 direct/supporting evidence 是否足以完整回答使用者問題。
+        conflict_instruction = (
+            "請同時做 evidence relationship/conflict classification。"
+            if self.enable_conflict_analysis
+            else "conflict_groups 一律回空陣列，evidence_relationship 回 unknown。"
+        )
+
+        prompt = f"""你是 Evidence Sufficiency Checker。你的工作不是重新排序 evidence，而是判斷目前已篩出的 direct/supporting evidence 是否足以完整回答使用者問題。{conflict_instruction}
 
 使用者問題：
 {query}
@@ -428,18 +643,24 @@ Knowledge Units：
 {chr(10).join(blocks)}
 
 判斷規則：
-1. 先把使用者真正要求回答的資訊拆成 query_aspects；只拆實質需求，不要把語氣詞拆成 aspect。
+1. 先把使用者真正要求回答的資訊拆成 query_aspects；只拆實質需求。
 2. sufficient=true 只有在每一個實質 aspect 都可由目前 evidence 支持時才成立。
-3. 允許「組合式覆蓋（compositional coverage）」：若 evidence A 已建立 A=X，evidence B 已建立 B=Y，使用者只問 A 與 B 的基本定義差異，則 X 與 Y 本身即可構成該比較 aspect 的支持，不要求資料庫一定另有一句逐字寫成「A 與 B 的差異是...」。
-4. 但若使用者要求的是完整操作規則、適用條件、例外、版本差異或欄位連動，不能只靠兩個名詞定義推導；缺少操作面證據時仍須判 insufficient。
-5. constraint alignment 仍然有效：欄位、位址、格式/版本、實體、代碼角色若不一致，不得把它們視為同一 aspect 的直接支持。
-6. 若使用者明確指定 MARC 21，CMARC 專屬的欄位操作規則不能直接當成 MARC 21 規則；除非 evidence 明確提供兩格式的對照或一致性依據。
-7. 多意圖、比較、條件、例外、兩段式問題必須逐項覆蓋。
-8. 若使用者問「有哪些、還有其他、列出、全部、完整」等枚舉型問題，不能只因找到一個例子就判 sufficient；需有足以支撐該回答範圍的多項證據，或同源 FAQ/provenance 已補足。
-9. 不得假設未提供的知識存在，也不得用常識補齊缺口。
-10. covered_aspects 的 evidence_ids 只能使用目前提供的 ID。
-11. missing_aspects 明確指出仍缺什麼；若沒有缺口，回傳空陣列。
-12. reason 只寫簡短、可稽核的判斷理由，不要輸出詳細思考過程。
+3. 允許組合式覆蓋：不同 evidence 可共同建立一個基本比較或結論。
+4. 但若使用者要求正式操作規則、MARC/RDA 欄位/指標/分欄、代碼選擇、分類/作者號規則、版本差異或例外，不得把「相似案例」類比成新的正式規則。缺少該情境的明確規則鏈時必須 insufficient。
+5. constraint alignment 必須嚴格：欄位、位址、格式/版本、實體、代碼角色、關係及適用條件若不一致，不得視為同一規則的直接支持。
+6. 多意圖、比較、條件、例外、兩段式問題必須逐項覆蓋。
+7. 枚舉型問題（有哪些、全部、還有其他）不能只找到一例就 sufficient。
+8. evidence_relationship 只描述目前 relevant evidence 的整體語意關係：
+   - compatible：可以同時成立，沒有實質衝突。
+   - complementary：回答不同部分，可組合。
+   - conditional：結論不同是因適用條件不同，並非真正矛盾。
+   - conflict：相同規則範圍、相同適用條件下得到互斥結論。
+   - unknown：證據不足以判斷關係。
+9. conflict_groups 只列值得稽核的 evidence 組。same_scope=true 只有在格式/欄位/規範/資源類型/適用條件足以視為同一規則範圍時成立。
+10. 不要用日期替 evidence 判定語意上誰對誰錯。日期解析與「最新優先」由 Python 後處理；你只負責判斷是否是真正 same-scope conflict。
+11. coverage_mode=evidence_grounded 表示 evidence 已直接/明確建立規則；compositional 表示多筆 evidence 的明確內容可安全組合、但沒有新增規則；insufficient 表示仍有缺口。
+12. covered_aspects / conflict_groups 的 evidence_ids 只能使用目前提供的 ID。
+13. reason 只寫簡短、可稽核理由，不要輸出詳細思考過程。
 """
 
         self._sufficiency_calls += 1
@@ -475,7 +696,53 @@ Knowledge Units：
             for x in result.get("missing_aspects", [])
             if str(x).strip()
         ]
+
+        raw_groups = []
+        if self.enable_conflict_analysis:
+            for group in result.get("conflict_groups", []):
+                evidence_ids = [
+                    str(eid).strip()
+                    for eid in group.get("evidence_ids", [])
+                    if str(eid).strip() in allowed_ids
+                ]
+                if len(set(evidence_ids)) < 2:
+                    continue
+                relationship = str(group.get("relationship", "unknown")).strip()
+                if relationship not in relationship_values:
+                    relationship = "unknown"
+                raw_groups.append(
+                    {
+                        "evidence_ids": list(dict.fromkeys(evidence_ids)),
+                        "relationship": relationship,
+                        "same_scope": bool(group.get("same_scope", False)),
+                        "reason": str(group.get("reason", "")).strip(),
+                    }
+                )
+
+        conflict_resolution = self._resolve_conflict_groups(raw_groups, relevant)
+        conflict_detected = conflict_resolution["status"] in {
+            "resolved_by_date",
+            "unresolved",
+        }
+
         sufficient = bool(result.get("sufficient", False)) and not missing_aspects
+        if conflict_resolution["status"] == "unresolved":
+            sufficient = False
+            marker = "現有 evidence 在相同適用條件下存在未解決衝突"
+            if marker not in missing_aspects:
+                missing_aspects.append(marker)
+
+        coverage_mode = str(result.get("coverage_mode", "insufficient")).strip()
+        if coverage_mode not in {"evidence_grounded", "compositional", "insufficient"}:
+            coverage_mode = "insufficient"
+        if not sufficient:
+            coverage_mode = "insufficient"
+
+        evidence_relationship = str(
+            result.get("evidence_relationship", "unknown")
+        ).strip()
+        if evidence_relationship not in relationship_values:
+            evidence_relationship = "unknown"
 
         return {
             "sufficient": sufficient,
@@ -486,4 +753,9 @@ Knowledge Units：
             "relevant_evidence_count": len(relevant),
             "direct_evidence_count": len(direct),
             "checked_by_llm": True,
+            "rule_sensitive": bool(rule_sensitive),
+            "coverage_mode": coverage_mode,
+            "evidence_relationship": evidence_relationship,
+            "conflict_detected": conflict_detected,
+            "conflict_resolution": conflict_resolution,
         }

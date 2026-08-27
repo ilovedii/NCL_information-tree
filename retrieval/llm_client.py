@@ -16,6 +16,82 @@ class OllamaError(LLMClientError):
 class OpenAICompatibleError(LLMClientError):
     """Exception raised by OpenAI-compatible chat endpoints."""
 
+class SentenceTransformerEmbeddingClient:
+    """
+    Local embedding client backed by sentence-transformers.
+
+    It intentionally exposes the same `.embed(...)` interface used by
+    HybridRetriever, so the retrieval architecture does not need to know
+    whether embeddings come from Ollama or Hugging Face.
+    """
+
+    def __init__(
+        self,
+        model_name,
+        device="auto",
+        query_prefix="",
+        document_prefix="",
+    ):
+        try:
+            import torch
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise LLMClientError(
+                "缺少 sentence-transformers。請先執行："
+                "pip install -U sentence-transformers"
+            ) from exc
+
+        if str(device).strip().lower() == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.model_name = str(model_name)
+        self.device = str(device)
+
+        self.query_prefix = str(query_prefix or "")
+        self.document_prefix = str(document_prefix or "")
+
+        print(
+            f"載入 SentenceTransformer embedding model："
+            f"{self.model_name} ({self.device})"
+        )
+
+        self.model = SentenceTransformer(
+            self.model_name,
+            device=self.device,
+        )
+
+    def embed(self, model, texts, input_type="passage"):
+        if str(model) != self.model_name:
+            raise LLMClientError(
+                f"Embedding model 不一致："
+                f"client={self.model_name!r}, requested={model!r}"
+            )
+
+        if isinstance(texts, str):
+            texts = [texts]
+
+        input_type = str(input_type or "").strip().lower()
+
+        if input_type == "query":
+            prefix = self.query_prefix
+        elif input_type == "passage":
+            prefix = self.document_prefix
+        else:
+            prefix = ""
+
+        prepared_texts = [
+            f"{prefix}{str(text)}"
+            for text in texts
+        ]
+
+        vectors = self.model.encode(
+            prepared_texts,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            show_progress_bar=False,
+        )
+
+        return np.asarray(vectors, dtype=np.float32)
 
 def _parse_json_content(content):
     """Parse JSON returned as plain text or inside a Markdown code fence."""
@@ -96,12 +172,14 @@ class OllamaClient:
         data = self._post("/api/chat", payload)
         return data.get("message", {}).get("content", "").strip()
 
-    def embed(self, model, texts):
+    def embed(self, model, texts, input_type=None):
         payload = {"model": model, "input": texts}
         data = self._post("/api/embed", payload)
+
         embeddings = data.get("embeddings")
         if not embeddings:
             raise OllamaError("Ollama /api/embed 沒有回傳 embeddings")
+
         return np.asarray(embeddings, dtype=np.float32)
 
 
@@ -224,7 +302,7 @@ class OpenAICompatibleClient:
                 f"Structured output 無法解析：{content[:1500]}"
             ) from exc
 
-    def embed(self, model, texts):
+    def embed(self, model, texts, input_type=None):
         raise OpenAICompatibleError(
             "此 OpenAICompatibleClient 目前只設定 chat/completions；"
             "embedding 請繼續使用 OllamaClient。"
