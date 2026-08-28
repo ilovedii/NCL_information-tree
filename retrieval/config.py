@@ -7,164 +7,125 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 @dataclass
 class AppConfig:
-    csv_path: str = str(
-        PROJECT_DIR / "data" / "llm_retrieval.csv"
-    )
+    """V4 Simple Tree-RAG configuration.
 
-    # Ollama stays available as an optional provider.
-    # Service Mode below does NOT use online embedding.
+    Design goal: two main LLM stages only.
+    1) one-shot Tree retrieval planning
+    2) grounded answer / fallback decision
+
+    All document retrieval between them is local BM25.
+    """
+
+    csv_path: str = str(PROJECT_DIR / "data" / "llm_retrieval.csv")
+
+    # Providers
     ollama_url: str = "http://localhost:11434"
-
-    # NCL OpenAI-compatible API.
     ncl_api_url: str = "https://catsmartap.ncl.edu.tw/v1"
     ncl_verify_ssl: bool = False
-
-    # Generation provider: "ncl" or "ollama".
     router_provider: str = "ncl"
-    evidence_provider: str = "ncl"
     answer_provider: str = "ncl"
 
+    # Models
     router_model: str = "google/gemma-4-31B-it"
-    evidence_model: str = "google/gemma-4-31B-it"
     answer_model: str = "google/gemma-4-31B-it"
-
-    # Kept for backward compatibility / research mode.
-    embedding_model: str = "qwen3-embedding:0.6b"
-
-    # Service latency: Router may keep thinking;
-    # Evidence/Final Answer disable think to reduce latency.
-    router_think: bool = True
-    evidence_think: bool = False
+    embedding_model: str = "qwen3-embedding:0.6b"  # compatibility; V4 default is BM25-only
+    router_think: bool = False
     answer_think: bool = False
 
     # ------------------------------------------------------------------
-    # Ranked hierarchical routing
+    # Stage 1: one-shot Tree planning
     # ------------------------------------------------------------------
-    # Router keeps ranked alternatives so RAG can backtrack without
-    # making another Router API call.
-    router_l1_max_choices: int = 2
-    router_l2_max_choices: int = 3
-    router_l3_max_choices: int = 8
+    # First shortlist taxonomy leaves locally with BM25, then ask ONE LLM call
+    # to choose the most plausible paths and create a safe retrieval rewrite.
+    tree_candidate_pool: int = 16
+    router_top_paths: int = 3
 
-    # Beam retained after each hierarchy stage.
-    l1_beam: int = 2
-    l2_beam: int = 3
-    final_beam: int = 12
+    # ------------------------------------------------------------------
+    # Multi-channel local retrieval
+    # ------------------------------------------------------------------
+    # Tree is a retrieval prior, not a hard filter.
+    tree_primary_top_k: int = 6
+    tree_secondary_top_k: int = 5
+    tree_tertiary_top_k: int = 4
 
-    # Static knowledge: no query-time LLM summarization.
-    static_knowledge_dir: str = str(
-        PROJECT_DIR / "cache" / "static_node_knowledge"
+    # Global atomic rescue prevents taxonomy/node assignment misses.
+    global_top_k: int = 8
+    global_rewrite_top_k: int = 4
+
+    # FAQ-level retrieval prevents an original complete answer from being lost
+    # after atomic decomposition.
+    faq_top_k: int = 2
+    faq_max_units_per_faq: int = 8
+
+    # Provenance completion: if a high-ranked atomic hit belongs to an original
+    # FAQ, retrieve relevant sibling atoms from that FAQ. This is query-agnostic
+    # and repairs information lost by atomic decomposition.
+    provenance_anchor_top_k: int = 4  # per retrieval channel
+    provenance_max_faqs: int = 6
+    provenance_max_units_per_faq: int = 10
+
+    # RRF-style channel weights. These are ranking priors, not hard gates.
+    tree_channel_weight: float = 1.20
+    global_channel_weight: float = 1.00
+    faq_channel_weight: float = 1.05
+    provenance_channel_weight: float = 0.35
+    carryover_channel_weight: float = 0.55
+
+    # Final atomic-evidence context for the Answer LLM.
+    context_limit: int = 16
+    refinement_context_limit: int = 20
+
+    # ------------------------------------------------------------------
+    # Source-level FAQ context (V4.2)
+    # ------------------------------------------------------------------
+    # Atomic units remain the primary retrieval granularity. For questions
+    # whose answer is a set/list, V4.2 may additionally attach one or two
+    # original FAQ/source families as a completeness view.
+    source_context_top_k: int = 1
+    source_min_atomic_hits: int = 2
+    source_max_units_per_faq: int = 12
+
+    # ------------------------------------------------------------------
+    # Evidence-guided refinement
+    # ------------------------------------------------------------------
+    # If the first Answer LLM says the database is partially relevant but a
+    # specific fact is missing, perform exactly ONE extra local retrieval round.
+    enable_refinement: bool = True
+
+    # V4.1: refinement stays inside the already-routed local subtree first.
+    # It explores sibling L3 nodes under the same L2 parent instead of
+    # re-running lexical routing over the whole taxonomy.
+    refinement_parent_limit: int = 2
+    refinement_sibling_top_k: int = 12
+
+    # Pseudo-relevance feedback: reuse terminology from the most relevant
+    # first-round evidence when constructing the second retrieval query.
+    refinement_feedback_top_k: int = 2
+    refinement_feedback_answer_chars: int = 220
+
+    # Deprecated compatibility knob from V4.0.x. Kept so older CLI/config
+    # overrides do not break, but V4.1 no longer uses whole-tree lexical
+    # refinement paths.
+    refinement_extra_tree_paths: int = 0
+
+    # ------------------------------------------------------------------
+    # Knowledge fallback
+    # ------------------------------------------------------------------
+    # When database evidence is still insufficient, the model answers from
+    # its own knowledge, but the user-facing answer is always explicitly labelled.
+
+    # Allow transparent model-knowledge fallback only after DB retrieval/refinement
+    # is still insufficient. The answer must remain explicitly labelled.
+    allow_model_knowledge_fallback: bool = True
+
+    # Every non-grounded first pass is logged for later human review / DB growth.
+    fallback_queue_path: str = str(
+        PROJECT_DIR / "logs" / "knowledge_fallback_queue.jsonl"
     )
-    static_include_topic: bool = True
-    static_exact_dedup: bool = True
 
-    # ------------------------------------------------------------------
-    # Progressive evidence search
-    # ------------------------------------------------------------------
-    # BM25-like CandidateOrderer is ONLY used inside the selected node.
-    # It does not choose L1/L2/L3 in Service Mode.
-    progressive_batch_size: int = 8
-    evidence_batch_size: int = 8
-    use_progressive_search: bool = True
-    use_local_candidate_ordering: bool = True
-
-    # Research-mode compatibility. Service Mode uses LLM-ranked backtracking.
-    use_sibling_l3_expansion: bool = True
-    sibling_route_discount: float = 0.60
-    # Routed alternatives are now Router-score dominant.
-    # Local BM25 is still used inside each node and as a light signal for
-    # same-parent sibling recovery; it is not allowed to override a clearly
-    # better routed branch by itself.
-    frontier_local_weight: float = 0.25
-    frontier_route_weight: float = 0.75
-
-    # Same-parent L3 recovery gets a bounded local-evidence bonus.
-    # This preserves T01 Leader/07 sibling recovery while avoiding the
-    # U02/U03 failure where a lower-scored branch displaced Router #2.
-    sibling_local_weight: float = 0.30
-    sibling_route_weight: float = 0.70
-    sibling_override_margin: float = 0.05
-
-    # Evidence / sufficiency.
-    use_sufficiency_check: bool = True
-    sufficiency_min_supporting_without_direct: int = 2
-    final_include_background: bool = False
-    final_context_unit_limit: int = 12
-
-    # Provenance-based FAQ family expansion.
-    use_faq_expansion: bool = True
-    max_anchor_evidence: int = 3
-    max_anchor_faqs: int = 2
-    max_siblings_per_faq: int = 8
-
-    # ------------------------------------------------------------------
-    # Service Mode: ranked hierarchical backtracking
-    # ------------------------------------------------------------------
-    service_mode: bool = True
-
-    # Primary L3 + at most two further routed nodes.
-    # Typical policy:
-    # L3 #1 -> L3 #2 -> L3 #3,
-    # then stop / fallback if time remains.
-    service_max_progressive_steps: int = 7
-
-    # One batch per routed node by default.
-    # This prioritizes breadth over repeatedly scanning a wrong L3.
-    service_max_batches_per_node: int = 5
-
-    # Allow up to two distinct non-primary nodes in one query.
-    # V3.2 effectively locked onto the first non-primary node, which caused
-    # U02/U03 to skip a higher-scored Router alternative.
-    service_max_nonprimary_nodes: int = 2
-
-    # If True, a node may get one extra batch ONLY if the previous batch
-    # added direct evidence or reduced missing_aspects.
-    # Keep False initially for the <60s service target.
-    service_retry_node_on_progress: bool = False
-
-    # Stop launching new Evidence-LLM work after this elapsed query time.
-    service_search_budget_seconds: float = 200.0
-
-    # Global BM25 fallback is only attempted while enough budget remains.
-    service_fallback_cutoff_seconds: float = 43.0
-
-    # Final answer context cap.
-    service_final_context_unit_limit: int = 12
-
-    # ------------------------------------------------------------------
-    # Knowledge-assisted final fallback
-    # ------------------------------------------------------------------
-    # When retrieval remains insufficient, Final Answer may use model
-    # domain knowledge only for non-rule-sensitive questions. Exact MARC/RDA/
-    # code/field/indicator cataloguing rules must abstain when evidence is
-    # insufficient instead of analogically inventing a rule (U01 safeguard).
-    allow_knowledge_assisted_answer: bool = True
-    block_knowledge_assist_for_rule_sensitive: bool = True
-
-    # Conflict analysis is folded into the existing Sufficiency LLM call.
-    # LLM classifies evidence relationships; Python resolves true same-scope
-    # conflicts by question_date first. Ties/missing dates remain unresolved.
-    enable_conflict_analysis: bool = True
-
-    # ------------------------------------------------------------------
-    # Final retrieval safety net
-    # ------------------------------------------------------------------
-    use_fallback_retrieval: bool = True
-    fallback_on_tree_exhausted: bool = True
-    routing_confidence_threshold: float = 0.20
-
-    # Service Mode uses BM25-only global fallback.
-    fallback_top_k: int = 8
+    # Pure BM25 by default. Existing retriever remains compatible with embeddings.
     use_embedding: bool = False
     embedding_batch_size: int = 64
 
-    # ------------------------------------------------------------------
-    # Backward-compatible flags
-    # ------------------------------------------------------------------
-    include_parent_summary: bool = True
-    parent_expand_on_router_uncertain: bool = True
-    parent_fallback_direct_score: float = 0.80
-    parent_fallback_path_threshold: float = 0.75
-
-    # Per API call timeout, not overall SLA.
-    timeout: int = 45
+    # Per remote API call timeout.
+    timeout: int = 60

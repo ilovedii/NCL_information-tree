@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
-from llm_client import OllamaError
+from llm_client import LLMClientError
+from retriever import BM25
 
 
 @dataclass
@@ -15,16 +16,17 @@ class RoutePath:
         return self.l1, self.l2, self.l3
 
     def display(self):
-        return " > ".join(
-            x for x in (self.l1, self.l2, self.l3) if x
-        )
+        return " > ".join(x for x in (self.l1, self.l2, self.l3) if x)
 
 
 class TreeRouter:
-    """LLM taxonomy router that preserves ranked alternatives at each level.
+    """V4 one-shot Tree retrieval planner.
 
-    The router proposes hypotheses. It does not decide truth.
-    Evidence/Sufficiency later verify whether a routed path is useful.
+    Unlike V3, this router does not make separate L1/L2/L3 LLM calls.
+    It first uses local BM25 over taxonomy leaf cards to create a small candidate
+    pool, then uses exactly one LLM call to rank complete Tree paths.
+
+    Tree routing is therefore a retrieval prior, not a hard evidence filter.
     """
 
     def __init__(
@@ -32,92 +34,135 @@ class TreeRouter:
         taxonomy,
         llm,
         model,
-        think=True,
-        max_choices=3,
-        l1_max_choices=None,
-        l2_max_choices=None,
-        l3_max_choices=None,
+        think=False,
+        candidate_pool=16,
+        top_paths=3,
     ):
         self.taxonomy = taxonomy
         self.llm = llm
         self.model = model
-        self.think = think
+        self.think = bool(think)
+        self.candidate_pool = max(3, int(candidate_pool))
+        self.top_paths = max(1, int(top_paths))
 
-        # Backward-compatible default.
-        self.max_choices = int(max_choices)
+        self._path_specs = self._build_terminal_path_specs()
+        self._path_cards = [self._compact_path_card(spec) for spec in self._path_specs]
+        self._path_bm25 = BM25(self._path_cards)
 
-        self.l1_max_choices = int(
-            l1_max_choices
-            if l1_max_choices is not None
-            else max_choices
-        )
-        self.l2_max_choices = int(
-            l2_max_choices
-            if l2_max_choices is not None
-            else max_choices
-        )
-        self.l3_max_choices = int(
-            l3_max_choices
-            if l3_max_choices is not None
-            else max_choices
-        )
+    def _build_terminal_path_specs(self):
+        specs = []
+        for l1 in self.taxonomy.l1_nodes():
+            for l2 in self.taxonomy.l2_nodes(l1):
+                l3s = self.taxonomy.l3_nodes(l1, l2)
+                if l3s:
+                    for l3 in l3s:
+                        specs.append({"l1": l1, "l2": l2, "l3": l3})
+                else:
+                    specs.append({"l1": l1, "l2": l2, "l3": None})
+        return specs
 
-    def _route(
-        self,
-        query,
-        current_path,
-        level,
-        candidates,
-        max_choices=None,
-    ):
-        candidates = list(candidates)
-        if not candidates:
+    @staticmethod
+    def _profile_text(profile):
+        parts = [
+            str(profile.get("description", "")).strip(),
+            str(profile.get("example", "")).strip(),
+            str(profile.get("boundary", "")).strip(),
+        ]
+        return "\n".join(x for x in parts if x)
+
+    def _compact_path_card(self, spec):
+        l1 = spec["l1"]
+        l2 = spec["l2"]
+        l3 = spec.get("l3")
+        path = " > ".join(x for x in (l1, l2, l3) if x)
+
+        sections = [f"完整路徑：{path}"]
+        sections.append(
+            "L1：" + self._profile_text(self.taxonomy.node_profile("L1", node=l1))
+        )
+        sections.append(
+            "L2："
+            + self._profile_text(
+                self.taxonomy.node_profile("L2", l1=l1, node=l2)
+            )
+        )
+        if l3:
+            sections.append(
+                "L3："
+                + self._profile_text(
+                    self.taxonomy.node_profile("L3", l1=l1, l2=l2, node=l3)
+                )
+            )
+        return "\n".join(sections)
+
+    def _lexical_shortlist(self, query, pool=None):
+        if not self._path_specs:
             return []
+        pool = min(max(1, int(pool or self.candidate_pool)), len(self._path_specs))
+        scores = self._path_bm25.scores(query)
+        order = sorted(
+            range(len(self._path_specs)),
+            key=lambda i: float(scores[i]),
+            reverse=True,
+        )[:pool]
+        return [
+            {
+                "spec": self._path_specs[i],
+                "card": self._path_cards[i],
+                "lexical_score": float(scores[i]),
+                "lexical_rank": rank,
+            }
+            for rank, i in enumerate(order, start=1)
+        ]
 
-        ids = [f"C{i + 1}" for i in range(len(candidates))]
-        mapping = dict(zip(ids, candidates))
-
-        cards = []
-        for cid, node in zip(ids, candidates):
-            if level == "L1":
-                card = self.taxonomy.node_card(
-                    "L1",
-                    node=node,
+    def lexical_paths(self, query, top_k=3):
+        """Local-only Tree paths for refinement; zero LLM/API calls."""
+        short = self._lexical_shortlist(query, pool=max(top_k, self.candidate_pool))
+        if not short:
+            return []
+        best = max(float(x["lexical_score"]) for x in short) or 1.0
+        paths = []
+        for item in short[:top_k]:
+            spec = item["spec"]
+            score = max(0.0, min(1.0, float(item["lexical_score"]) / best))
+            paths.append(
+                RoutePath(
+                    l1=spec["l1"],
+                    l2=spec["l2"],
+                    l3=spec.get("l3"),
+                    score=score,
+                    trace=[
+                        {
+                            "level": "PATH_LOCAL",
+                            "node": " > ".join(
+                                x for x in (spec["l1"], spec["l2"], spec.get("l3")) if x
+                            ),
+                            "score": score,
+                            "reason": "Evidence-guided local taxonomy BM25 refinement",
+                        }
+                    ],
                 )
-            elif level == "L2":
-                card = self.taxonomy.node_card(
-                    "L2",
-                    l1=current_path.l1,
-                    node=node,
-                )
-            else:
-                card = self.taxonomy.node_card(
-                    "L3",
-                    l1=current_path.l1,
-                    l2=current_path.l2,
-                    node=node,
-                )
+            )
+        return paths
 
-            cards.append(f"[{cid}]\n{card}")
+    def plan(self, query):
+        shortlist = self._lexical_shortlist(query)
+        if not shortlist:
+            return {"paths": [], "search_query": query, "query_focus": query, "fallback": True}
 
-        if max_choices is None:
-            if level == "L1":
-                max_choices = self.l1_max_choices
-            elif level == "L2":
-                max_choices = self.l2_max_choices
-            else:
-                max_choices = self.l3_max_choices
-
-        max_items = min(
-            max(1, int(max_choices)),
-            len(candidates),
+        ids = [f"P{i}" for i in range(1, len(shortlist) + 1)]
+        mapping = dict(zip(ids, shortlist))
+        candidate_text = "\n\n".join(
+            f"[{pid}] lexical_rank={item['lexical_rank']}\n{item['card']}"
+            for pid, item in zip(ids, shortlist)
         )
 
+        max_items = min(self.top_paths, len(shortlist))
         schema = {
             "type": "object",
             "properties": {
                 "query_focus": {"type": "string"},
-                "uncertain": {"type": "boolean"},
+                "search_query": {"type": "string"},
                 "selected": {
                     "type": "array",
                     "minItems": 1,
@@ -125,250 +170,97 @@ class TreeRouter:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "candidate_id": {
-                                "type": "string",
-                                "enum": ids,
-                            },
-                            "score": {
-                                "type": "number",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
+                            "candidate_id": {"type": "string", "enum": ids},
+                            "score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                             "reason": {"type": "string"},
                         },
-                        "required": [
-                            "candidate_id",
-                            "score",
-                            "reason",
-                        ],
+                        "required": ["candidate_id", "score", "reason"],
                     },
                 },
             },
-            "required": [
-                "query_focus",
-                "uncertain",
-                "selected",
-            ],
+            "required": ["query_focus", "search_query", "selected"],
         }
 
-        if level == "L3":
-            ranking_instruction = f"""
-9. 這是 L3 路由。請把「最可能包含可回答證據」的節點排前面。
-10. 為支援 evidence-driven backtracking，可保留最多 {max_items} 個有合理可能性的 L3 候選；
-    不要因第一名很明顯就只保留一個。若第二、第三候選仍有可能包含跨節點或歷史分類下的證據，
-    應保留並給較低分數。
-"""
-        else:
-            ranking_instruction = f"""
-9. 最多保留 {max_items} 個真正合理的候選，並依 score 由高到低排序。
-"""
-
-        prompt = f"""你是國家圖書館知識分類樹的路由器。
-你的工作是根據正式 taxonomy 提出「可能包含答案證據的 ranked node hypotheses」，
-不是直接回答使用者問題，也不是宣告第一名一定正確。
+        prompt = f"""你是國家圖書館 Tree-RAG 的一次性 Retrieval Planner。
+你的工作只有兩件事：
+1. 從候選 taxonomy 完整路徑中選出最可能包含答案證據的前 {max_items} 條路徑。
+2. 產生一個適合 BM25 檢索的 search_query。
 
 使用者問題：
 {query}
 
-目前路徑：
-{current_path.display() if current_path else "ROOT"}
+候選完整路徑：
+{candidate_text}
 
-候選節點：
-{chr(10).join(cards)}
-
-判斷規則：
-1. 正式定義、正式例子與分類邊界是主要判斷依據；代表資料只能作輔助。
-2. 判斷使用者真正想解決的規則、操作、概念或知識類型，不要只依關鍵字。
-3. 必須遵守目前父節點，不得跨越 taxonomy 父子關係。
-4. 第一名應是最具體、最可能包含答案證據的節點。
-5. Router 是 proposal/ranking，不是 truth decision；Evidence Selector 之後會驗證。
-6. score 為 0 到 1 的節點相關程度。
-7. reason 只寫可稽核的短理由，指出符合哪個正式定義或邊界。
-8. 必須只使用候選 ID，不得建立新的分類。
-{ranking_instruction}
+規則：
+- Tree path 是搜尋優先序，不代表答案一定在該節點。
+- 保留跨節點可能性；不要只因第一名合理就忽略其他合理路徑。
+- search_query 必須保留使用者明確寫出的 MARC/RDA 欄位、位址、indicator、subfield、代碼或名稱。
+- search_query 可加入候選 taxonomy 卡片中已出現的同義術語/英文術語。
+- 不得把你自己猜測的答案內容、未出現在使用者問題或 taxonomy 卡片中的規則值塞進 search_query。
+- 不要回答使用者問題。
 """
 
-        result = self.llm.chat_json(
-            self.model,
-            [{"role": "user", "content": prompt}],
-            schema,
-            temperature=0.0,
-            think=self.think,
-        )
+        try:
+            result = self.llm.chat_json(
+                self.model,
+                [{"role": "user", "content": prompt}],
+                schema,
+                temperature=0.0,
+                think=self.think,
+            )
+        except LLMClientError:
+            # Availability fallback: keep the system useful even if planner API fails.
+            local_paths = self.lexical_paths(query, top_k=max_items)
+            return {
+                "paths": local_paths,
+                "search_query": query,
+                "query_focus": query,
+                "fallback": True,
+            }
 
-        output = []
+        paths = []
         seen = set()
-
         for item in result.get("selected", []):
-            cid = item.get("candidate_id")
-
-            if cid not in mapping or cid in seen:
+            pid = str(item.get("candidate_id", "")).strip()
+            if pid not in mapping:
                 continue
-
-            seen.add(cid)
-
-            output.append(
-                {
-                    "node": mapping[cid],
-                    "score": float(
-                        item.get("score", 0.0)
-                    ),
-                    "reason": str(
-                        item.get("reason", "")
-                    ).strip(),
-                    "query_focus": str(
-                        result.get("query_focus", "")
-                    ).strip(),
-                    "uncertain": bool(
-                        result.get("uncertain", False)
-                    ),
-                }
-            )
-
-        if not output:
-            raise OllamaError(
-                "Router 沒有選出有效候選節點"
-            )
-
-        output.sort(
-            key=lambda x: x["score"],
-            reverse=True,
-        )
-
-        return output
-
-    def route_tree(
-        self,
-        query,
-        l1_beam=2,
-        l2_global_beam=3,
-        final_beam=12,
-    ):
-        # L1 ranking.
-        l1_decisions = self._route(
-            query,
-            None,
-            "L1",
-            self.taxonomy.l1_nodes(),
-            max_choices=self.l1_max_choices,
-        )
-
-        l1_paths = [
-            RoutePath(
-                l1=decision["node"],
-                l2=None,
-                l3=None,
-                score=max(
-                    decision["score"],
-                    1e-6,
-                ),
-                trace=[
-                    {
-                        "level": "L1",
-                        **decision,
-                    }
-                ],
-            )
-            for decision in l1_decisions[:l1_beam]
-        ]
-
-        # L2 ranking under each retained L1.
-        l2_paths = []
-
-        for path in l1_paths:
-            decisions = self._route(
-                query,
-                path,
-                "L2",
-                self.taxonomy.l2_nodes(
-                    path.l1
-                ),
-                max_choices=self.l2_max_choices,
-            )
-
-            for decision in decisions:
-                l2_paths.append(
-                    RoutePath(
-                        l1=path.l1,
-                        l2=decision["node"],
-                        l3=None,
-                        score=(
-                            path.score
-                            * max(
-                                decision["score"],
-                                1e-6,
-                            )
-                        ),
-                        trace=(
-                            path.trace
-                            + [
-                                {
-                                    "level": "L2",
-                                    **decision,
-                                }
-                            ]
-                        ),
-                    )
-                )
-
-        l2_paths.sort(
-            key=lambda x: x.score,
-            reverse=True,
-        )
-
-        l2_paths = l2_paths[
-            :l2_global_beam
-        ]
-
-        # L3 ranking under each retained L2.
-        final_paths = []
-
-        for path in l2_paths:
-            children = self.taxonomy.l3_nodes(
-                path.l1,
-                path.l2,
-            )
-
-            if not children:
-                final_paths.append(path)
+            spec = mapping[pid]["spec"]
+            key = (spec["l1"], spec["l2"], spec.get("l3"))
+            if key in seen:
                 continue
-
-            decisions = self._route(
-                query,
-                path,
-                "L3",
-                children,
-                max_choices=self.l3_max_choices,
+            seen.add(key)
+            score = max(0.0, min(1.0, float(item.get("score", 0.0))))
+            path_text = " > ".join(x for x in key if x)
+            paths.append(
+                RoutePath(
+                    l1=spec["l1"],
+                    l2=spec["l2"],
+                    l3=spec.get("l3"),
+                    score=score,
+                    trace=[
+                        {
+                            "level": "PATH",
+                            "node": path_text,
+                            "score": score,
+                            "reason": str(item.get("reason", "")).strip(),
+                            "query_focus": str(result.get("query_focus", "")).strip(),
+                        }
+                    ],
+                )
             )
 
-            for decision in decisions:
-                final_paths.append(
-                    RoutePath(
-                        l1=path.l1,
-                        l2=path.l2,
-                        l3=decision["node"],
-                        score=(
-                            path.score
-                            * max(
-                                decision["score"],
-                                1e-6,
-                            )
-                        ),
-                        trace=(
-                            path.trace
-                            + [
-                                {
-                                    "level": "L3",
-                                    **decision,
-                                }
-                            ]
-                        ),
-                    )
-                )
+        if not paths:
+            paths = self.lexical_paths(query, top_k=max_items)
 
-        final_paths.sort(
-            key=lambda x: x.score,
-            reverse=True,
-        )
+        paths.sort(key=lambda x: x.score, reverse=True)
+        return {
+            "paths": paths[:max_items],
+            "search_query": str(result.get("search_query", "")).strip() or query,
+            "query_focus": str(result.get("query_focus", "")).strip() or query,
+            "fallback": False,
+        }
 
-        return final_paths[:final_beam]
+    # Backward-compatible method name used by earlier callers.
+    def route_tree(self, query, l1_beam=2, l2_global_beam=3, final_beam=3):
+        return self.plan(query)["paths"][:final_beam]

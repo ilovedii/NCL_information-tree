@@ -1,48 +1,45 @@
+import json
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
 
-from candidate_orderer import CandidateOrderer
-from context_builder import ContextBuilder
-from evidence_selector import EvidenceSelector
-from knowledge_loader import KnowledgeLoader
+
 from llm_client import OllamaClient, OpenAICompatibleClient
-from retriever import HybridRetriever
-from router import TreeRouter
-from static_knowledge import StaticKnowledgeStore
+from retriever import BM25, HybridRetriever
+from router import RoutePath, TreeRouter
 from taxonomy import TaxonomyIndex
 
 
 class TreeGuidedRAG:
-    """V3.3 Evidence-Safe Progressive Tree-Guided RAG with Service Mode.
+    """V4.1 Simple Tree-RAG.
 
-    Core principles:
-    - Taxonomy decides the search space.
-    - BM25-like local ordering only decides what is inspected first.
-    - Evidence Selector verifies relevance.
-    - Sufficiency decides whether search can stop.
-    - Service Mode bounds online LLM work and disables online embeddings.
-    - No taxonomy reclassification is performed at query time.
+    Online flow:
+      1. one-shot Tree planner (one LLM call)
+      2. local multi-channel BM25 retrieval
+         - Tree-local
+         - global atomic rescue
+         - FAQ-level provenance retrieval
+      3. Answer/Judge LLM
+      4. optional ONE evidence-guided refinement retrieval + final Answer LLM
+      5. if DB is still insufficient, clearly-labelled model knowledge fallback
+
+    V4 intentionally has no progressive batch controller, repeated sufficiency
+    checker, sibling scheduler, or EvidenceSelector loop.
     """
 
     def __init__(
         self,
         config,
         router_llm=None,
-        evidence_llm=None,
         answer_llm=None,
         embedding_llm=None,
     ):
         self.config = config
-
-        # This service-oriented rag.py defaults to Service Mode even when an
-        # older config.py does not yet contain a service_mode field.
-        self.service_mode = bool(getattr(config, "service_mode", True))
-
         self.taxonomy = TaxonomyIndex(config.csv_path)
 
-        ollama_client = OllamaClient(
-            config.ollama_url,
-            timeout=config.timeout,
-        )
+        ollama_client = OllamaClient(config.ollama_url, timeout=config.timeout)
         ncl_client = OpenAICompatibleClient(
             config.ncl_api_url,
             timeout=config.timeout,
@@ -55,14 +52,9 @@ class TreeGuidedRAG:
                 return ncl_client
             if provider == "ollama":
                 return ollama_client
-            raise ValueError(
-                f"未知 LLM provider: {provider!r}；目前只支援 'ncl' 或 'ollama'"
-            )
+            raise ValueError(f"未知 LLM provider: {provider!r}；目前只支援 'ncl' 或 'ollama'")
 
         self.router_llm = router_llm or generation_client(config.router_provider)
-        self.evidence_llm = (
-            evidence_llm or generation_client(config.evidence_provider)
-        )
         self.answer_llm = answer_llm or generation_client(config.answer_provider)
         self.embedding_llm = embedding_llm or ollama_client
 
@@ -71,1870 +63,1229 @@ class TreeGuidedRAG:
             self.router_llm,
             config.router_model,
             think=config.router_think,
+            candidate_pool=config.tree_candidate_pool,
+            top_paths=config.router_top_paths,
         )
 
-        self.knowledge_loader = KnowledgeLoader(self.taxonomy)
-        self.knowledge_store = StaticKnowledgeStore(
-            self.taxonomy,
-            cache_dir=config.static_knowledge_dir,
-            include_topic=config.static_include_topic,
-            exact_dedup=config.static_exact_dedup,
-        )
-
-        # Service Mode disables Evidence-LLM thinking to reduce latency.
-        evidence_think = (
-            False if self.service_mode else bool(config.evidence_think)
-        )
-        self.evidence_selector = EvidenceSelector(
-            self.evidence_llm,
-            config.evidence_model,
-            think=evidence_think,
-            batch_size=config.evidence_batch_size,
-            min_supporting_without_direct=(
-                config.sufficiency_min_supporting_without_direct
-            ),
-            enable_conflict_analysis=bool(
-                getattr(config, "enable_conflict_analysis", True)
-            ),
-        )
-
-        self.candidate_orderer = CandidateOrderer()
-        self.context_builder = ContextBuilder(self.taxonomy)
-
-        # Critical for Service Mode:
-        # do NOT build/query the 5914-item embedding index online.
-        effective_use_embedding = (
-            bool(config.use_embedding) and not self.service_mode
-        )
         self.retriever = HybridRetriever(
             self.taxonomy,
             self.embedding_llm,
             config.embedding_model,
-            use_embedding=effective_use_embedding,
+            use_embedding=config.use_embedding,
             batch_size=config.embedding_batch_size,
         )
 
-    # ------------------------------------------------------------------
-    # Service helpers
-    # ------------------------------------------------------------------
-
-    def _service_int(self, name, default, minimum=0):
-        value = getattr(self.config, name, default)
-        try:
-            value = int(value)
-        except (TypeError, ValueError):
-            value = int(default)
-        return max(minimum, value)
-
-    def _service_float(self, name, default, minimum=0.0):
-        value = getattr(self.config, name, default)
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            value = float(default)
-        return max(minimum, value)
-
-    def _progressive_batch_size(self):
-        configured = max(
-            1,
-            int(getattr(self.config, "progressive_batch_size", 40)),
-        )
-        if not self.service_mode:
-            return configured
-
-        # Works even with the older config.py where service_batch_size
-        # does not exist.
-        service_batch = self._service_int(
-            "service_batch_size",
-            8,
-            minimum=1,
-        )
-        return min(configured, service_batch)
+        self._all_indices = list(range(len(self.taxonomy.df)))
+        (
+            self._faq_ids,
+            self._faq_indices,
+            self._faq_bm25,
+            self._faq_source_units,
+            self._faq_position,
+        ) = self._build_faq_index()
 
     # ------------------------------------------------------------------
-    # Taxonomy / pack helpers
+    # Local retrieval channels
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _node_key(l1, l2=None, l3=None):
-        return (str(l1 or ""), str(l2 or ""), str(l3 or ""))
+    def _build_faq_index(self):
+        if "faq_id" not in self.taxonomy.df.columns:
+            return [], {}, None, {}, {}
 
-    @staticmethod
-    def _path_key(path):
-        return TreeGuidedRAG._node_key(path.l1, path.l2, path.l3)
-
-    @staticmethod
-    def _unit_key(unit):
-        source_ids = tuple(
-            sorted(
-                str(x).strip()
-                for x in unit.get("source_ids", [])
-                if str(x).strip()
-            )
-        )
-        if source_ids:
-            return ("source_ids", source_ids)
-        return (
-            "content",
-            str(unit.get("content", "")).strip(),
-            str(unit.get("time_scope", "")).strip(),
-        )
-
-    def _load_path_pack(self, path, role, force_rebuild=False):
-        bundle = self.knowledge_loader.load_path(path, role=role)
-        return self.knowledge_store.load(
-            bundle,
-            force_rebuild=force_rebuild,
-        )
-
-    def _load_node_pack(
-        self,
-        l1,
-        l2=None,
-        l3=None,
-        role="sibling",
-        force_rebuild=False,
-    ):
-        bundle = self.knowledge_loader.load_node(
-            l1,
-            l2=l2,
-            l3=l3,
-            role=role,
-        )
-        return self.knowledge_store.load(
-            bundle,
-            force_rebuild=force_rebuild,
-        )
-
-    @staticmethod
-    def _l2_route_score(path):
-        for step in path.trace:
-            if step.get("level") == "L2" and step.get("node") == path.l2:
-                try:
-                    return float(step.get("score", 0.0))
-                except (TypeError, ValueError):
-                    return 0.0
-        try:
-            return float(path.score)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _make_state(self, pack, route_score, origin, source_path=None):
-        return {
-            "key": self._node_key(
-                pack.get("l1"),
-                pack.get("l2"),
-                pack.get("l3"),
-            ),
-            "pack": pack,
-            "remaining_units": list(pack.get("knowledge_units", [])),
-            "route_score": float(route_score or 0.0),
-            "origin": str(origin),
-            "source_path": source_path,
-            "batches": 0,
-            "assessed_unique": 0,
-            "opened": False,
-            "family_expanded": False,
-        }
-
-    def _slice_pack(self, pack, units):
-        sliced = dict(pack)
-        sliced["knowledge_units"] = list(units)
-        sliced["document_count"] = len(units)
-        sliced["source_coverage_ratio"] = 1.0 if units else 0.0
-        return sliced
-
-    # ------------------------------------------------------------------
-    # Global fallback
-    # ------------------------------------------------------------------
-
-    def _fallback_pack(self, query, paths, force=False):
-        if not self.config.use_fallback_retrieval:
-            return None
-
-        if force:
-            should_fallback = True
-        elif not paths:
-            should_fallback = True
-        else:
-            should_fallback = (
-                paths[0].score < self.config.routing_confidence_threshold
-            )
-
-        if not should_fallback:
-            return None
-
-        indices = list(range(len(self.taxonomy.df)))
-
-        # In Service Mode self.retriever.use_embedding is False, so this
-        # becomes a pure BM25 fallback and never builds the embedding index.
-        query_vector = (
-            self.retriever.query_embedding(query)
-            if self.retriever.use_embedding
-            else None
-        )
-
-        top_k = int(self.config.fallback_top_k)
-        if self.service_mode:
-            top_k = min(
-                top_k,
-                self._service_int(
-                    "service_fallback_top_k",
-                    8,
-                    minimum=1,
-                ),
-            )
-
-        hits = self.retriever.search(
-            query,
-            indices,
-            top_k=top_k,
-            query_vector=query_vector,
-        )
-
-        units = []
-        source_ids = []
-
-        for i, hit in enumerate(hits, start=1):
-            record = self.taxonomy.document_record(hit["idx"])
-            atomic_id = str(record.get("atomic_id", "")).strip()
-            if atomic_id:
-                source_ids.append(atomic_id)
-
-            unit = self.knowledge_store.unit_from_document(
-                record,
-                knowledge_id=f"F{i:03d}",
-                unit_type="fallback_knowledge",
-            )
-            units.append(unit)
-
-        fallback_name = (
-            "Global Hybrid Fallback"
-            if self.retriever.use_embedding
-            else "Global BM25 Fallback"
-        )
-        fallback_source = (
-            "global_hybrid_fallback"
-            if self.retriever.use_embedding
-            else "global_bm25_fallback"
-        )
-
-        return {
-            "fingerprint": "fallback",
-            "cache_hit": False,
-            "static_source": fallback_source,
-            "role": "fallback",
-            "level": "GLOBAL",
-            "l1": "",
-            "l2": "",
-            "l3": "",
-            "path": fallback_name,
-            "document_count": len(units),
-            "date_start": "",
-            "date_end": "",
-            "all_source_ids": source_ids,
-            "knowledge_units": units,
-            "coverage_note": (
-                "Progressive Tree evidence 仍不足，因此加入全域 BM25 Retrieval"
-                " 作為服務模式最後安全網。"
-                if not self.retriever.use_embedding
-                else
-                "Progressive Tree evidence 仍不足，因此加入全域 Hybrid Retrieval"
-                " 作為最後安全網。"
-            ),
-            "source_coverage_ratio": 1.0 if units else 0.0,
-        }
-
-    # ------------------------------------------------------------------
-    # FAQ provenance expansion
-    # ------------------------------------------------------------------
-
-    def _faq_family_pack(self, prioritized_evidence):
-        """Recover atomic siblings from the same original FAQ provenance."""
-        anchor_ids = []
-        seen_anchor_ids = set()
-        direct_count = 0
-
-        max_anchor_evidence = int(self.config.max_anchor_evidence)
-        max_anchor_faqs = int(self.config.max_anchor_faqs)
-        max_siblings_per_faq = int(self.config.max_siblings_per_faq)
-
-        if self.service_mode:
-            max_anchor_evidence = min(max_anchor_evidence, 3)
-            max_anchor_faqs = min(max_anchor_faqs, 2)
-            max_siblings_per_faq = min(max_siblings_per_faq, 8)
-
-        for item in prioritized_evidence:
-            if item.get("utility") != "direct":
+        groups = {}
+        for idx, raw_faq_id in self.taxonomy.df["faq_id"].items():
+            faq_id = str(raw_faq_id).strip()
+            if not faq_id:
                 continue
+            groups.setdefault(faq_id, []).append(int(idx))
 
-            direct_count += 1
-            for source_id in item.get("source_ids", []):
-                atomic_id = str(source_id).strip()
-                if atomic_id and atomic_id not in seen_anchor_ids:
-                    seen_anchor_ids.add(atomic_id)
-                    anchor_ids.append(atomic_id)
+        faq_ids = list(groups.keys())
+        texts = []
+        source_units = {}
 
-            if direct_count >= max_anchor_evidence:
+        for faq_id in faq_ids:
+            chunks = []
+            atomics = []
+
+            for idx in groups[faq_id]:
+                record = self.taxonomy.document_record(idx)
+                question = str(record.get("question", "")).strip()
+                answer = str(record.get("answer", "")).strip()
+
+                chunks.append(f"問題：{question}\n答案：{answer}")
+                atomics.append(
+                    {
+                        "idx": int(idx),
+                        "atomic_id": str(record.get("atomic_id", "")).strip(),
+                        "question_date": str(record.get("question_date", "")).strip(),
+                        "question": question,
+                        "answer": answer,
+                        "taxonomy_paths": record.get("taxonomy_paths", ""),
+                    }
+                )
+
+            texts.append("\n".join(chunks))
+            source_units[faq_id] = {
+                "source_id": f"FAQ:{faq_id}",
+                "faq_id": faq_id,
+                "atomics": atomics,
+            }
+
+        faq_position = {faq_id: i for i, faq_id in enumerate(faq_ids)}
+
+        return (
+            faq_ids,
+            groups,
+            BM25(texts) if texts else None,
+            source_units,
+            faq_position,
+        )
+
+    def _tree_k(self, rank):
+        if rank == 0:
+            return self.config.tree_primary_top_k
+        if rank == 1:
+            return self.config.tree_secondary_top_k
+        return self.config.tree_tertiary_top_k
+
+    def _tree_hits(self, query, paths, channel="tree", top_k_override=None):
+        hits = []
+        for route_rank, path in enumerate(paths):
+            indices = self.taxonomy.docs_for_path(path)
+            if not indices:
+                continue
+            top_k = (
+                int(top_k_override)
+                if top_k_override is not None
+                else self._tree_k(route_rank)
+            )
+            local = self.retriever.search(
+                query,
+                indices,
+                top_k=top_k,
+            )
+            for local_rank, hit in enumerate(local, start=1):
+                hits.append(
+                    {
+                        **hit,
+                        "channel": channel,
+                        "channel_rank": local_rank,
+                        "route_rank": route_rank + 1,
+                        "route_score": float(path.score),
+                        "path": path.display(),
+                    }
+                )
+        return hits
+
+    def _global_hits(self, query, top_k=None, channel="global"):
+        top_k = int(top_k or self.config.global_top_k)
+        hits = self.retriever.search(query, self._all_indices, top_k=top_k)
+        return [
+            {
+                **hit,
+                "channel": channel,
+                "channel_rank": rank,
+                "route_rank": None,
+                "route_score": 0.0,
+                "path": "GLOBAL",
+            }
+            for rank, hit in enumerate(hits, start=1)
+        ]
+
+    def _faq_hits(self, query):
+        if self._faq_bm25 is None or not self._faq_ids:
+            return []
+
+        scores = self._faq_bm25.scores(query)
+        order = sorted(
+            range(len(self._faq_ids)),
+            key=lambda i: float(scores[i]),
+            reverse=True,
+        )[: min(self.config.faq_top_k, len(self._faq_ids))]
+
+        result = []
+        channel_rank = 0
+        for faq_pos in order:
+            faq_id = self._faq_ids[faq_pos]
+            indices = self._faq_indices[faq_id]
+
+            # Within the selected FAQ, order atomic units by local relevance, but
+            # keep multiple siblings so a decomposed complete answer can recover.
+            ordered = self.retriever.search(
+                query,
+                indices,
+                top_k=min(self.config.faq_max_units_per_faq, len(indices)),
+            )
+            for hit in ordered:
+                channel_rank += 1
+                result.append(
+                    {
+                        **hit,
+                        "channel": "faq",
+                        "channel_rank": channel_rank,
+                        "route_rank": None,
+                        "route_score": 0.0,
+                        "path": f"FAQ:{faq_id}",
+                        "faq_id": faq_id,
+                    }
+                )
+        return result
+
+    def _provenance_hits(self, query, *anchor_groups):
+        """Complete original FAQ provenance for high-ranked atomic hits.
+
+        Atomic decomposition can fragment one coherent source answer. Anchor
+        slots are distributed across retrieval channels so Tree-local evidence
+        cannot crowd out a strong global rescue hit (and vice versa). Selected
+        FAQ siblings are then restored locally; no extra LLM call is involved.
+        """
+        groups = [list(g or []) for g in anchor_groups if g]
+        if not groups or "faq_id" not in self.taxonomy.df.columns:
+            return []
+
+        max_faqs = max(1, int(self.config.provenance_max_faqs))
+        per_group = max(1, max_faqs // len(groups))
+        scan_limit = max(1, int(self.config.provenance_anchor_top_k))
+        faq_ids = []
+        faq_anchor_rank = {}
+        seen_faqs = set()
+
+        for group in groups:
+            added = 0
+            for hit in group[:scan_limit]:
+                idx = int(hit["idx"])
+                faq_id = str(self.taxonomy.df.at[idx, "faq_id"]).strip()
+                if not faq_id or faq_id in seen_faqs:
+                    continue
+                seen_faqs.add(faq_id)
+                faq_ids.append(faq_id)
+                added += 1
+                faq_anchor_rank[faq_id] = added
+                if added >= per_group or len(faq_ids) >= max_faqs:
+                    break
+            if len(faq_ids) >= max_faqs:
                 break
 
-        if not anchor_ids:
-            return None
-
-        sibling_indices = self.taxonomy.sibling_indices_for_atomic_ids(
-            anchor_ids,
-            max_faqs=max_anchor_faqs,
-            max_siblings_per_faq=max_siblings_per_faq,
-        )
-
-        if not sibling_indices:
-            return None
-
-        existing_source_ids = {
-            str(source_id).strip()
-            for item in prioritized_evidence
-            for source_id in item.get("source_ids", [])
-            if str(source_id).strip()
-        }
-
-        units = []
-        expanded_source_ids = []
-        expanded_faq_ids = []
-        seen_faq_ids = set()
-
-        for idx in sibling_indices:
-            record = self.taxonomy.document_record(idx)
-            atomic_id = str(record.get("atomic_id", "")).strip()
-            faq_id = str(record.get("faq_id", "")).strip()
-
-            if not atomic_id or atomic_id in existing_source_ids:
+        result = []
+        stride = max(1, int(self.config.provenance_max_units_per_faq))
+        for faq_pos, faq_id in enumerate(faq_ids, start=1):
+            indices = self._faq_indices.get(faq_id, [])
+            if not indices:
                 continue
-
-            unit = self.knowledge_store.unit_from_document(
-                record,
-                knowledge_id=f"FAQ{len(units) + 1:03d}",
-                unit_type="related_source",
-            )
-            units.append(unit)
-            expanded_source_ids.append(atomic_id)
-
-            if faq_id and faq_id not in seen_faq_ids:
-                seen_faq_ids.add(faq_id)
-                expanded_faq_ids.append(faq_id)
-
-        if not units:
-            return None
-
-        return {
-            "fingerprint": "faq_family_expansion",
-            "cache_hit": False,
-            "static_source": "faq_provenance",
-            "role": "faq_family",
-            "level": "FAQ",
-            "l1": "",
-            "l2": "",
-            "l3": "",
-            "path": "Related Original FAQ",
-            "document_count": len(units),
-            "date_start": "",
-            "date_end": "",
-            "all_source_ids": expanded_source_ids,
-            "knowledge_units": units,
-            "coverage_note": (
-                "根據 direct evidence 的原始 faq_id，補回同一原始問答中"
-                "被 atomic decomposition 拆開的 knowledge units。"
-            ),
-            "source_coverage_ratio": 1.0,
-            "anchor_source_ids": anchor_ids,
-            "expanded_faq_ids": expanded_faq_ids,
-            "expanded_source_ids": expanded_source_ids,
-        }
-
-    def _expand_faq_once(
-        self,
-        query,
-        prioritized_evidence,
-        knowledge_packs,
-    ):
-        if not self.config.use_faq_expansion:
-            return prioritized_evidence, None, 0
-
-        faq_pack = self._faq_family_pack(prioritized_evidence)
-        if faq_pack is None:
-            return prioritized_evidence, None, 0
-
-        before = len(prioritized_evidence)
-
-        prioritized_evidence = self.evidence_selector.extend_prioritized(
-            query,
-            prioritized_evidence,
-            [faq_pack],
-        )
-
-        added = len(prioritized_evidence) - before
-        if added <= 0:
-            return prioritized_evidence, None, 0
-
-        knowledge_packs.append(faq_pack)
-        return prioritized_evidence, faq_pack, added
-
-    @staticmethod
-    def _faq_trace(faq_packs, added_total):
-        if not faq_packs:
-            return {
-                "triggered": False,
-                "added_unique_evidence": 0,
-            }
-
-        anchor_source_ids = []
-        expanded_faq_ids = []
-        expanded_source_ids = []
-
-        for pack in faq_packs:
-            for value in pack.get("anchor_source_ids", []):
-                if value not in anchor_source_ids:
-                    anchor_source_ids.append(value)
-
-            for value in pack.get("expanded_faq_ids", []):
-                if value not in expanded_faq_ids:
-                    expanded_faq_ids.append(value)
-
-            for value in pack.get("expanded_source_ids", []):
-                if value not in expanded_source_ids:
-                    expanded_source_ids.append(value)
-
-        return {
-            "triggered": True,
-            "rounds": len(faq_packs),
-            "anchor_source_ids": anchor_source_ids,
-            "expanded_faq_ids": expanded_faq_ids,
-            "expanded_source_ids": expanded_source_ids,
-            "added_unique_evidence": added_total,
-        }
-
-    # ------------------------------------------------------------------
-    # Sufficiency / ordering
-    # ------------------------------------------------------------------
-
-    def _check_sufficiency(self, query, prioritized_evidence):
-        if not self.config.use_sufficiency_check:
-            return {
-                "sufficient": self.evidence_selector.has_direct(
-                    prioritized_evidence
-                ),
-                "query_aspects": [],
-                "covered_aspects": [],
-                "missing_aspects": [],
-                "reason": (
-                    "sufficiency check disabled; fallback to direct evidence"
-                ),
-                "relevant_evidence_count": len(
-                    self.evidence_selector.filter_for_context(
-                        prioritized_evidence
-                    )
-                ),
-                "direct_evidence_count": sum(
-                    1
-                    for item in prioritized_evidence
-                    if item.get("utility") == "direct"
-                ),
-                "checked_by_llm": False,
-            }
-
-        return self.evidence_selector.check_sufficiency(
-            query,
-            prioritized_evidence,
-        )
-
-    @staticmethod
-    def _relevant_evidence_ids(evidence):
-        return {
-            item.get("evidence_id")
-            for item in evidence or []
-            if item.get("utility") in {"direct", "supporting"}
-        }
-
-    def _focus_text(self, query, sufficiency, prioritized_evidence):
-        """Build local ordering focus without another API call."""
-        parts = []
-
-        for value in (
-            sufficiency.get("missing_aspects", [])
-            if sufficiency
-            else []
-        ):
-            value = str(value).strip()
-            if value:
-                parts.append(value)
-
-        relevant = self.evidence_selector.filter_for_context(
-            prioritized_evidence,
-            include_background=False,
-        )
-
-        for item in relevant[:3]:
-            content = str(item.get("content", "")).strip()
-            if content:
-                parts.append(content[:800])
-
-        return "\n".join(parts)
-
-    def _register_pack(
-        self,
-        pack,
-        knowledge_packs,
-        opened_pack_keys,
-    ):
-        key = self._node_key(
-            pack.get("l1"),
-            pack.get("l2"),
-            pack.get("l3"),
-        )
-
-        # FAQ/fallback use synthetic empty taxonomy keys; distinguish by path.
-        if not any(key):
-            key = (
-                "runtime",
-                pack.get("role", ""),
-                pack.get("path", ""),
+            ordered = self.retriever.search(
+                query,
+                indices,
+                top_k=min(stride, len(indices)),
             )
 
-        if key not in opened_pack_keys:
-            opened_pack_keys.add(key)
-            knowledge_packs.append(pack)
-
-    def _add_sibling_states(
-        self,
-        source_state,
-        states,
-        state_by_key,
-        routed_path_by_key,
-        force_rebuild=False,
-    ):
-        if not self.config.use_sibling_l3_expansion:
-            return []
-
-        pack = source_state["pack"]
-        l1 = pack.get("l1")
-        l2 = pack.get("l2")
-        l3 = pack.get("l3")
-
-        if not l1 or not l2 or not l3:
-            return []
-
-        added = []
-
-        parent_score = (
-            self._l2_route_score(source_state["source_path"])
-            if source_state.get("source_path") is not None
-            else source_state.get("route_score", 0.0)
-        )
-
-        inherited_score = (
-            float(parent_score)
-            * float(self.config.sibling_route_discount)
-        )
-
-        for sibling_l3 in self.taxonomy.l3_nodes(l1, l2):
-            if sibling_l3 == l3:
-                continue
-
-            key = self._node_key(l1, l2, sibling_l3)
-
-            # V3.4.1: merge duplicate routing/sibling identity instead of
-            # silently skipping it.
-            #
-            # A node can already exist because the Router returned it as a
-            # lower-ranked alternative, while it is ALSO a same-parent L3
-            # sibling of the current node. In that case, keeping only the
-            # low Router score loses the hierarchical recovery signal and can
-            # starve the sibling under the Service Mode step budget.
-            if key in state_by_key:
-                existing_state = state_by_key[key]
-                existing_route_score = float(
-                    existing_state.get("route_score", 0.0)
+            # Provenance is a completion/support channel, not an independent
+            # relevance vote. Preserve sibling order and give every sibling its
+            # own rank so one FAQ cannot flood the final context with many
+            # artificial rank-1 candidates.
+            for sibling_rank, hit in enumerate(ordered, start=1):
+                result.append(
+                    {
+                        **hit,
+                        "channel": "provenance",
+                        "channel_rank": (faq_pos - 1) * stride + sibling_rank,
+                        "route_rank": None,
+                        "route_score": 0.0,
+                        "path": f"PROVENANCE_FAQ:{faq_id}",
+                        "faq_id": faq_id,
+                    }
                 )
+        return result
 
-                # Promote only when the inherited sibling score is stronger.
-                # This preserves a genuinely strong Router score when one
-                # already exists, while restoring same-parent recovery for
-                # cases such as T01 Leader/07.
-                if (
-                    existing_state.get("origin") == "routed_alternative"
-                    and inherited_score > existing_route_score
-                ):
-                    existing_state["route_score"] = float(inherited_score)
-                    existing_state["origin"] = "sibling_l3"
-                    existing_state["sibling_promoted_from_routed"] = True
-                    added.append(existing_state)
+    def _channel_contribution(self, hit):
+        rank = max(1, int(hit.get("channel_rank", 1)))
+        channel = hit.get("channel")
+        if channel in {"tree", "refine_tree", "refine_sibling"}:
+            # Tree is a relevance prior, not a hard gate. A path discovered by
+            # evidence-guided refinement may be appended after the initial routes;
+            # do not suppress its best local hit merely because of list position.
+            route_score = max(0.0, min(1.0, float(hit.get("route_score", 0.0))))
+            route_prior = 0.75 + 0.25 * route_score
+            weight = float(self.config.tree_channel_weight) * route_prior
+        elif channel in {"global", "global_rewrite", "refine_global"}:
+            weight = float(self.config.global_channel_weight)
+        elif channel == "first_round":
+            weight = float(self.config.carryover_channel_weight)
+        elif channel == "provenance":
+            weight = float(self.config.provenance_channel_weight)
+        else:
+            weight = float(self.config.faq_channel_weight)
+        return weight / (60.0 + rank)
 
-                continue
+    def _merge_hits(self, *groups, limit=None):
+        merged = {}
+        for group in groups:
+            for hit in group or []:
+                idx = int(hit["idx"])
+                entry = merged.setdefault(
+                    idx,
+                    {
+                        "idx": idx,
+                        "rrf_score": 0.0,
+                        "max_bm25": float("-inf"),
+                        "channels": [],
+                        "paths": [],
+                    },
+                )
+                entry["rrf_score"] += self._channel_contribution(hit)
+                entry["max_bm25"] = max(
+                    entry["max_bm25"], float(hit.get("bm25", 0.0))
+                )
+                channel = str(hit.get("channel", ""))
+                if channel and channel not in entry["channels"]:
+                    entry["channels"].append(channel)
+                path = str(hit.get("path", ""))
+                if path and path not in entry["paths"]:
+                    entry["paths"].append(path)
 
-            routed_path = routed_path_by_key.get(key)
-
-            if routed_path is not None:
-                role = "alternative"
-                route_score = float(routed_path.score)
-                source_path = routed_path
-                origin = "routed_alternative"
-            else:
-                role = "sibling"
-                route_score = inherited_score
-                source_path = None
-                origin = "sibling_l3"
-
-            sibling_pack = self._load_node_pack(
-                l1,
-                l2=l2,
-                l3=sibling_l3,
-                role=role,
-                force_rebuild=force_rebuild,
-            )
-
-            state = self._make_state(
-                sibling_pack,
-                route_score=route_score,
-                origin=origin,
-                source_path=source_path,
-            )
-
-            states.append(state)
-            state_by_key[key] = state
-            added.append(state)
-
-        source_state["family_expanded"] = True
-        return added
-
-    def _frontier_priority(self, query, states, focus_text):
-        """Rank the next search node without turning BM25 into a hard retriever.
-
-        V3.3 policy:
-        - routed alternatives: Router score is authoritative for cross-branch order;
-        - same-parent sibling L3: preserve local hierarchical recovery by combining
-          inherited parent-route score with a bounded local BM25 signal;
-        - primary/retry states: retain the generic route/local blend.
-
-        This preserves T01 Leader/07 sibling recovery while fixing U02/U03, where
-        a lower-scored branch could displace Router #2 because node-local BM25 was
-        weighted too heavily.
-        """
-        active = [
-            state
-            for state in states
-            if state.get("remaining_units")
-        ]
-        if not active:
-            return []
-
-        pseudo_packs = []
-        for state in active:
-            pseudo_pack = dict(state["pack"])
-            pseudo_pack["knowledge_units"] = state["remaining_units"]
-            pseudo_packs.append(pseudo_pack)
-
-        local_scores = self.candidate_orderer.score_packs_global(
-            query,
-            pseudo_packs,
-            extra_text=focus_text,
+        ranked = sorted(
+            merged.values(),
+            key=lambda x: (x["rrf_score"], x["max_bm25"]),
+            reverse=True,
         )
-        lo = min(local_scores)
-        hi = max(local_scores)
-        span = hi - lo
+        if limit and limit > 0:
+            ranked = ranked[: int(limit)]
 
-        ranked = []
-        for state, local in zip(active, local_scores):
-            local_norm = (
-                (local - lo) / span
-                if span > 1e-9
-                else 0.0
-            )
-            route_score = max(
-                0.0,
-                min(1.0, float(state.get("route_score", 0.0))),
-            )
-            origin = str(state.get("origin", ""))
-
-            if origin == "routed_alternative":
-                # Across routed branches, preserve the LLM Router ranking.
-                priority = route_score
-                policy = "router_score"
-            elif origin == "sibling_l3":
-                # Same-parent L3 recovery is the one locality exception. The
-                # sibling inherits a discounted parent score and needs local
-                # evidence signal to outrank a strong routed alternative.
-                priority = (
-                    float(getattr(self.config, "sibling_route_weight", 0.70))
-                    * route_score
-                    + float(getattr(self.config, "sibling_local_weight", 0.30))
-                    * local_norm
-                )
-                policy = "same_parent_sibling_hybrid"
-            else:
-                priority = (
-                    float(self.config.frontier_route_weight) * route_score
-                    + float(self.config.frontier_local_weight) * local_norm
-                )
-                policy = "generic_hybrid"
-
-            ranked.append(
+        evidence = []
+        for rank, item in enumerate(ranked, start=1):
+            record = self.taxonomy.document_record(item["idx"])
+            evidence.append(
                 {
-                    "state": state,
-                    "priority": float(priority),
-                    "local_score": float(local),
-                    "local_norm": float(local_norm),
-                    "route_score": route_score,
-                    "ranking_policy": policy,
+                    **record,
+                    "rank": rank,
+                    "retrieval_score": float(item["rrf_score"]),
+                    "bm25": float(item["max_bm25"]),
+                    "channels": item["channels"],
+                    "retrieved_paths": item["paths"],
+                }
+            )
+        return evidence
+
+    def _initial_retrieve(self, query, plan):
+        paths = plan["paths"]
+        rewrite = str(plan.get("search_query", "")).strip() or query
+        combined_query = query if rewrite == query else f"{query}\n{rewrite}"
+
+        # Global and FAQ retrieval do not depend on the remote planner. In run(),
+        # their original-query versions are launched concurrently with planning.
+        tree_hits = self._tree_hits(combined_query, paths)
+        rewrite_global = []
+        if rewrite and rewrite.strip() != query.strip():
+            rewrite_global = self._global_hits(
+                rewrite,
+                top_k=self.config.global_rewrite_top_k,
+                channel="global_rewrite",
+            )
+        return tree_hits, rewrite_global
+
+    @staticmethod
+    def _structural_constraints(text):
+        text = str(text or "")
+        lower = text.lower()
+        found = set()
+
+        # Leader/LDR positions, including forms such as LDR/06-07.
+        for m in re.finditer(
+            r"(?i)\b(?:leader|ldr)\s*/?\s*(\d{2})(?:\s*-\s*(\d{2}))?",
+            text,
+        ):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else start
+            if 0 <= start <= end <= 99 and end - start <= 10:
+                for pos in range(start, end + 1):
+                    found.add(f"ldr/{pos:02d}")
+
+        # Explicit MARC tag references.
+        tag_patterns = [
+            r"(?i)\btag\s*0*(\d{3})\b",
+            r"(?i)\bmarc(?:\s*21)?\s*(?:欄位|field)?\s*0*(\d{3})\b",
+            r"欄位\s*0*(\d{3})\b",
+            r"(\d{3})\s*段\b",
+        ]
+        for pattern in tag_patterns:
+            for m in re.finditer(pattern, text):
+                found.add(f"tag:{int(m.group(1)):03d}")
+
+        # Fixed-field positions such as 008/23 or 008/18-34.
+        for m in re.finditer(
+            r"\b(\d{3})\s*/\s*(\d{2})(?:\s*-\s*(\d{2}))?\b",
+            text,
+        ):
+            tag = int(m.group(1))
+            start = int(m.group(2))
+            end = int(m.group(3)) if m.group(3) else start
+            found.add(f"tag:{tag:03d}")
+            if 0 <= start <= end <= 99 and end - start <= 20:
+                for pos in range(start, end + 1):
+                    found.add(f"{tag:03d}/{pos:02d}")
+
+        # Subfields.
+        for m in re.finditer(r"\$([a-z0-9])", lower):
+            found.add(f"subfield:${m.group(1)}")
+
+        # Indicators, including "#4", "指標1", "indicator 2".
+        for m in re.finditer(r"#([0-9#])", text):
+            found.add(f"indicator-value:{m.group(1)}")
+        for m in re.finditer(r"(?i)(?:指標|indicator)\s*([12])", text):
+            found.add(f"indicator:{m.group(1)}")
+
+        return found
+
+    @classmethod
+    def _constraint_overlap(cls, target_text, evidence_text):
+        target = cls._structural_constraints(target_text)
+        if not target:
+            return 0
+        evidence = cls._structural_constraints(evidence_text)
+        return len(target & evidence)
+
+    @staticmethod
+    def _compact_feedback_text(item, answer_chars=220):
+        question = str(item.get("question", "")).strip()
+        answer = re.sub(r"\s+", " ", str(item.get("answer", "")).strip())
+        if answer_chars and answer_chars > 0:
+            answer = answer[: int(answer_chars)]
+        return "\n".join(x for x in (question, answer) if x)
+
+    def _build_refinement_search_query(
+        self,
+        original_query,
+        refinement_query,
+        missing,
+        first_round_evidence,
+    ):
+        """Build one evidence-guided second-pass query.
+
+        This is local pseudo-relevance feedback, not another LLM call.
+        The missing aspect remains the main target, while terminology from the
+        most relevant first-round evidence helps bridge vocabulary mismatch
+        (e.g. user wording vs. older cataloguing terminology).
+        """
+        base_parts = [
+            str(original_query or "").strip(),
+            str(refinement_query or "").strip(),
+            str(missing or "").strip(),
+        ]
+        base_query = "\n".join(x for x in base_parts if x)
+
+        evidence = list(first_round_evidence or [])
+        if not evidence:
+            return base_query, []
+
+        feedback_texts = [
+            self._compact_feedback_text(
+                item,
+                answer_chars=self.config.refinement_feedback_answer_chars,
+            )
+            for item in evidence
+        ]
+        feedback_texts = [x for x in feedback_texts if x]
+        if not feedback_texts:
+            return base_query, []
+
+        target_text = (
+            f"{original_query}\n{refinement_query}\n{missing}".strip()
+        )
+        scores = BM25(feedback_texts).scores(
+            f"{refinement_query}\n{missing}".strip() or original_query
+        )
+        overlaps = [
+            self._constraint_overlap(target_text, text)
+            for text in feedback_texts
+        ]
+        has_constraints = bool(self._structural_constraints(target_text))
+
+        candidate_indices = list(range(len(feedback_texts)))
+        if has_constraints and any(overlaps):
+            # When the query specifies an exact field/position/subfield,
+            # use only evidence aligned to at least one of those constraints.
+            candidate_indices = [i for i in candidate_indices if overlaps[i] > 0]
+
+        order = sorted(
+            candidate_indices,
+            key=lambda i: (overlaps[i], float(scores[i])),
+            reverse=True,
+        )
+
+        selected = []
+        selected_ids = []
+        limit = max(0, int(self.config.refinement_feedback_top_k))
+        for i in order[:limit]:
+            selected.append(feedback_texts[i])
+            evidence_id = str(evidence[i].get("atomic_id", "")).strip()
+            if evidence_id:
+                selected_ids.append(evidence_id)
+
+        if not selected:
+            return base_query, []
+
+        expanded = (
+            f"{base_query}\n"
+            "第一輪相關 evidence 用語：\n"
+            + "\n".join(selected)
+        ).strip()
+        return expanded, selected_ids
+
+    def _same_parent_sibling_scope(self, base_paths):
+        """Build local sibling-L3 search scopes under routed L2 parents.
+
+        Each parent scope is searched as one union of sibling L3 documents.
+        This avoids the ranking distortion caused by resetting local rank inside
+        every sibling node independently.
+        """
+        scopes = []
+        trace_paths = []
+        seen_parents = set()
+        parent_limit = max(1, int(self.config.refinement_parent_limit))
+
+        # Collect all already-selected L3 values under each routed parent.
+        selected_by_parent = {}
+        parent_score = {}
+        for base in base_paths:
+            if not base.l1 or not base.l2:
+                continue
+            parent = (base.l1, base.l2)
+            parent_score[parent] = max(
+                float(base.score),
+                float(parent_score.get(parent, 0.0)),
+            )
+            if base.l3:
+                selected_by_parent.setdefault(parent, set()).add(base.l3)
+
+        for base in base_paths:
+            if not base.l1 or not base.l2:
+                continue
+            parent = (base.l1, base.l2)
+            if parent in seen_parents:
+                continue
+            seen_parents.add(parent)
+            if len(scopes) >= parent_limit:
+                break
+
+            l3s = self.taxonomy.l3_nodes(base.l1, base.l2)
+            if not l3s:
+                continue
+
+            selected_l3s = selected_by_parent.get(parent, set())
+            sibling_l3s = [l3 for l3 in l3s if l3 not in selected_l3s]
+            if not sibling_l3s:
+                continue
+
+            indices = []
+            seen_indices = set()
+            inherited_score = (
+                max(0.0, min(1.0, float(parent_score.get(parent, base.score))))
+                * 0.90
+            )
+
+            for l3 in sibling_l3s:
+                for idx in self.taxonomy.docs_for_l3(base.l1, base.l2, l3):
+                    idx = int(idx)
+                    if idx in seen_indices:
+                        continue
+                    seen_indices.add(idx)
+                    indices.append(idx)
+
+                path_text = " > ".join((base.l1, base.l2, l3))
+                trace_paths.append(
+                    RoutePath(
+                        l1=base.l1,
+                        l2=base.l2,
+                        l3=l3,
+                        score=inherited_score,
+                        trace=[
+                            {
+                                "level": "PATH_SIBLING",
+                                "node": path_text,
+                                "score": inherited_score,
+                                "reason": (
+                                    "Evidence-guided refinement: sibling L3 "
+                                    "under the already-routed L2 parent"
+                                ),
+                            }
+                        ],
+                    )
+                )
+
+            if indices:
+                scopes.append(
+                    {
+                        "l1": base.l1,
+                        "l2": base.l2,
+                        "sibling_l3s": sibling_l3s,
+                        "indices": indices,
+                        "score": inherited_score,
+                    }
+                )
+
+        return scopes, trace_paths
+
+    def _sibling_scope_hits(self, query, scopes):
+        hits = []
+        per_parent_top_k = max(1, int(self.config.refinement_sibling_top_k))
+
+        for parent_rank, scope in enumerate(scopes, start=1):
+            local = self.retriever.search(
+                query,
+                scope["indices"],
+                top_k=min(per_parent_top_k, len(scope["indices"])),
+            )
+            offset = (parent_rank - 1) * per_parent_top_k
+            parent_path = f"{scope['l1']} > {scope['l2']} > [sibling L3 union]"
+
+            for local_rank, hit in enumerate(local, start=1):
+                hits.append(
+                    {
+                        **hit,
+                        "channel": "refine_sibling",
+                        "channel_rank": offset + local_rank,
+                        "route_rank": parent_rank,
+                        "route_score": float(scope["score"]),
+                        "path": parent_path,
+                    }
+                )
+
+        return hits
+
+    def _refinement_retrieve(
+        self,
+        original_query,
+        refinement_query,
+        missing,
+        base_paths,
+        first_round_evidence,
+    ):
+        search_query, feedback_ids = self._build_refinement_search_query(
+            original_query,
+            refinement_query,
+            missing,
+            first_round_evidence,
+        )
+
+        sibling_scopes, sibling_paths = self._same_parent_sibling_scope(
+            base_paths
+        )
+
+        # Keep original routed paths for continuity and expose sibling L3 paths
+        # in trace, but retrieve sibling documents as one union per L2 parent.
+        path_map = {p.key(): p for p in base_paths}
+        for path in sibling_paths:
+            path_map.setdefault(path.key(), path)
+        paths = list(path_map.values())
+
+        # First-round evidence already preserves the originally routed nodes.
+        # The refinement round therefore spends its local Tree budget only on
+        # the missing local neighborhood: sibling L3 documents under the same
+        # routed L2 parent. Global/FAQ rescue remains available in parallel.
+        tree_hits = self._sibling_scope_hits(
+            search_query,
+            sibling_scopes,
+        )
+        global_hits = self._global_hits(
+            search_query,
+            top_k=self.config.global_top_k,
+            channel="refine_global",
+        )
+        faq_hits = self._faq_hits(search_query)
+
+        meta = {
+            "requested_query": str(refinement_query or "").strip(),
+            "expanded_query": search_query,
+            "feedback_evidence_ids": feedback_ids,
+            "sibling_paths": [p.display() for p in sibling_paths],
+            "sibling_parent_scopes": [
+                {
+                    "parent": f"{scope['l1']} > {scope['l2']}",
+                    "sibling_l3s": list(scope["sibling_l3s"]),
+                    "document_count": len(scope["indices"]),
+                }
+                for scope in sibling_scopes
+            ],
+        }
+        return paths, tree_hits, global_hits, faq_hits, meta
+
+    # ------------------------------------------------------------------
+    # Answer / judge
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _answer_scope(query):
+        """Local completeness intent only; never participates in Tree routing."""
+        q = str(query or "").strip().lower()
+
+        set_markers = (
+            "有哪些",
+            "還有哪些",
+            "還有其他",
+            "還有什麼",
+            "其他工具",
+            "其他方法",
+            "其他選項",
+            "除了",
+            "列出",
+            "所有工具",
+            "所有方法",
+            "哪些工具",
+            "哪些方法",
+            "哪些選項",
+            "替代方案",
+            "alternatives",
+            "other tools",
+            "other methods",
+            "what other",
+            "which tools",
+            "which methods",
+            "besides ",
+            "list ",
+        )
+
+        return "set" if any(x in q for x in set_markers) else "focused"
+
+    def _source_evidence_for_set_query(self, query, evidence, answer_scope):
+        """Add source completeness only after normal atomic retrieval succeeds.
+
+        Atomic retrieval remains primary. A FAQ/source family is eligible only
+        if multiple atomic units from that same FAQ already survived Top-K.
+        """
+        if answer_scope != "set":
+            return []
+        if self._faq_bm25 is None or not evidence:
+            return []
+
+        stats = {}
+        for item in evidence:
+            faq_id = str(item.get("faq_id", "")).strip()
+            if not faq_id or faq_id not in self._faq_source_units:
+                continue
+
+            s = stats.setdefault(
+                faq_id,
+                {"count": 0, "best_rank": 10**9, "channels": set()},
+            )
+            s["count"] += 1
+            s["best_rank"] = min(
+                s["best_rank"],
+                int(item.get("rank", 10**9)),
+            )
+            s["channels"].update(item.get("channels", []))
+
+        min_hits = max(1, int(self.config.source_min_atomic_hits))
+        candidates = [
+            faq_id
+            for faq_id, s in stats.items()
+            if s["count"] >= min_hits
+        ]
+        if not candidates:
+            return []
+
+        faq_scores = self._faq_bm25.scores(query)
+        ranked = []
+
+        for faq_id in candidates:
+            pos = self._faq_position.get(faq_id)
+            faq_score = float(faq_scores[pos]) if pos is not None else 0.0
+            s = stats[faq_id]
+
+            # Prefer a coherent family already represented by more atomic hits.
+            key = (
+                int(s["count"]),
+                -int(s["best_rank"]),
+                faq_score,
+            )
+            ranked.append((key, faq_id, faq_score, s))
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+
+        top_k = max(0, int(self.config.source_context_top_k))
+        max_units = max(1, int(self.config.source_max_units_per_faq))
+
+        result = []
+        for _, faq_id, faq_score, s in ranked[:top_k]:
+            source = self._faq_source_units[faq_id]
+            result.append(
+                {
+                    "source_id": source["source_id"],
+                    "faq_id": faq_id,
+                    "faq_score": faq_score,
+                    "atomic_hit_count": int(s["count"]),
+                    "best_atomic_rank": int(s["best_rank"]),
+                    "channels": sorted(s["channels"]),
+                    "atomics": list(source["atomics"])[:max_units],
                 }
             )
 
-        ranked.sort(
-            key=lambda item: (
-                -item["priority"],
-                -item["route_score"],
-                item["state"]["pack"].get("path", ""),
-            )
-        )
+        return result
 
-        # Guard against weak locality bias. A same-parent sibling may override
-        # Router #2 only when its hybrid score wins by a meaningful margin.
-        # This protects T01 while preventing a near-tie sibling from displacing
-        # a clearly ranked routed alternative in U02/U03-like queries.
-        if ranked and ranked[0]["state"].get("origin") == "sibling_l3":
-            routed_items = [
-                item
-                for item in ranked
-                if item["state"].get("origin") == "routed_alternative"
+    @staticmethod
+    def _source_evidence_context(source_evidence):
+        blocks = []
+
+        for source in source_evidence or []:
+            lines = [
+                f"[SOURCE {source.get('source_id', '')}]",
+                (
+                    "用途：這是原始 FAQ/source 的完整性視圖；"
+                    "Atomic evidence 仍是主要精準證據。"
+                ),
             ]
-            if routed_items:
-                best_routed = max(routed_items, key=lambda item: item["priority"])
-                margin = float(
-                    getattr(self.config, "sibling_override_margin", 0.05)
+
+            for atom in source.get("atomics", []):
+                atomic_id = str(atom.get("atomic_id", "")).strip()
+                lines.append(
+                    f"- [{atomic_id}] 問題：{atom.get('question', '')}\n"
+                    f"  答案：{atom.get('answer', '')}"
                 )
-                if ranked[0]["priority"] < best_routed["priority"] + margin:
-                    ranked.remove(best_routed)
-                    best_routed = dict(best_routed)
-                    best_routed["ranking_policy"] = "router_score_margin_guard"
-                    ranked.insert(0, best_routed)
 
-        return ranked
+            blocks.append("\n".join(lines))
 
-    def _take_ordered_batch(
-        self,
-        query,
-        state,
-        focus_text,
-    ):
-        remaining = list(state.get("remaining_units", []))
-        if not remaining:
-            return []
+        return "\n\n".join(blocks)
 
-        if self.config.use_local_candidate_ordering:
-            ordered = self.candidate_orderer.order_units(
-                query,
-                remaining,
-                extra_text=focus_text,
+    @staticmethod
+    def _evidence_context(evidence):
+        blocks = []
+        for item in evidence:
+            source_id = str(item.get("atomic_id", "")).strip()
+            channels = ",".join(item.get("channels", []))
+            blocks.append(
+                f"[{source_id}] retrieval_channels={channels}\n"
+                f"日期：{item.get('question_date', '')}\n"
+                f"問題：{item.get('question', '')}\n"
+                f"答案：{item.get('answer', '')}\n"
+                f"taxonomy：{item.get('taxonomy_paths', '')}"
             )
-        else:
-            ordered = remaining
+        return "\n\n".join(blocks)
 
-        if self.config.use_progressive_search:
-            batch_size = self._progressive_batch_size()
-        else:
-            batch_size = max(1, len(ordered))
-
-        batch = ordered[:batch_size]
-
-        selected_keys = {
-            self._unit_key(unit)
-            for unit in batch
-        }
-
-        state["remaining_units"] = [
-            unit
-            for unit in remaining
-            if self._unit_key(unit) not in selected_keys
-        ]
-
-        return batch
-
-    def _assess_one_progressive_batch(
-        self,
-        query,
-        state,
-        prioritized_evidence,
-        sufficiency,
-        knowledge_packs,
-        opened_pack_keys,
-        faq_packs,
-        progressive_history,
-    ):
-        """Assess one node batch, check sufficiency, then expand FAQ only if needed.
-
-        V3.2 expanded FAQ before asking whether the newly found direct evidence was
-        already sufficient. V3.3 reverses that order. This removes avoidable FAQ
-        Evidence-LLM calls on simple/direct hits, while preserving FAQ fragmentation
-        recovery when a direct anchor exists but the answer is still incomplete.
-        """
-        focus_text = self._focus_text(
-            query,
-            sufficiency,
-            prioritized_evidence,
+    def _answer_schema(self, allowed_ids, allow_partial):
+        # V4.0.2:
+        # First pass is retrieval diagnosis only. It may either answer from DB
+        # evidence (grounded) or request exactly one refinement (partial).
+        # Model-knowledge fallback is intentionally unavailable until AFTER the
+        # refinement round has been attempted.
+        statuses = (
+            ["grounded", "partial"]
+            if allow_partial
+            else ["grounded", "knowledge_fallback"]
         )
-        batch = self._take_ordered_batch(query, state, focus_text)
-        if not batch:
-            return prioritized_evidence, sufficiency, 0
-
-        self._register_pack(state["pack"], knowledge_packs, opened_pack_keys)
-        state["opened"] = True
-        state["batches"] += 1
-
-        before_ids = {
-            item.get("evidence_id")
-            for item in prioritized_evidence or []
-        }
-        before_missing = set(
-            str(x).strip()
-            for x in (sufficiency or {}).get("missing_aspects", [])
-            if str(x).strip()
-        )
-        stats_before = self.evidence_selector.stats()
-        batch_t0 = time.perf_counter()
-
-        batch_pack = self._slice_pack(state["pack"], batch)
-        prioritized_evidence = self.evidence_selector.extend_prioritized(
-            query,
-            prioritized_evidence,
-            [batch_pack],
-        )
-
-        batch_new = [
-            item
-            for item in prioritized_evidence
-            if item.get("evidence_id") not in before_ids
-        ]
-        batch_relevant = [
-            item
-            for item in batch_new
-            if item.get("utility") in {"direct", "supporting"}
-        ]
-
-        # Sufficiency comes BEFORE FAQ expansion.
-        if sufficiency is None or batch_relevant:
-            sufficiency = self._check_sufficiency(query, prioritized_evidence)
-            sufficiency_rechecked = True
-        else:
-            sufficiency_rechecked = False
-
-        # Only when still insufficient and we have a direct anchor do we pay for
-        # provenance recovery. This preserves T03 MarcEdit fragmentation recovery.
-        faq_added = 0
-        faq_pack = None
-        allow_faq_round = (not self.service_mode or not faq_packs)
-        if (
-            allow_faq_round
-            and not bool((sufficiency or {}).get("sufficient", False))
-            and self.evidence_selector.has_direct(prioritized_evidence)
-        ):
-            (
-                prioritized_evidence,
-                faq_pack,
-                faq_added,
-            ) = self._expand_faq_once(
-                query,
-                prioritized_evidence,
-                knowledge_packs,
-            )
-            if faq_pack is not None:
-                faq_packs.append(faq_pack)
-            if faq_added > 0:
-                sufficiency = self._check_sufficiency(query, prioritized_evidence)
-                sufficiency_rechecked = True
-
-        new_evidence = [
-            item
-            for item in prioritized_evidence
-            if item.get("evidence_id") not in before_ids
-        ]
-        state_added = sum(
-            1
-            for item in new_evidence
-            if (
-                item.get("role") == state["pack"].get("role")
-                and item.get("path") == state["pack"].get("path")
-            )
-        )
-        state["assessed_unique"] += state_added
-
-        new_relevant = [
-            item
-            for item in new_evidence
-            if item.get("utility") in {"direct", "supporting"}
-        ]
-        new_direct = [
-            item
-            for item in new_evidence
-            if item.get("utility") == "direct"
-        ]
-        after_missing = set(
-            str(x).strip()
-            for x in (sufficiency or {}).get("missing_aspects", [])
-            if str(x).strip()
-        )
-        missing_aspects_reduced = bool(before_missing - after_missing)
-
-        stats_after = self.evidence_selector.stats()
-        elapsed = time.perf_counter() - batch_t0
-        progressive_history.append(
-            {
-                "step": len(progressive_history) + 1,
-                "origin": state.get("origin"),
-                "role": state["pack"].get("role"),
-                "path": state["pack"].get("path"),
-                "batch_index_for_node": state.get("batches", 0),
-                "batch_candidate_count": len(batch),
-                "node_remaining_after_batch": len(state.get("remaining_units", [])),
-                "new_unique_evidence": len(new_evidence),
-                "new_relevant_evidence": len(new_relevant),
-                "new_direct_evidence": len(new_direct),
-                "missing_aspects_reduced": missing_aspects_reduced,
-                "made_progress": bool(new_direct or missing_aspects_reduced),
-                "faq_added_unique_evidence": faq_added,
-                "sufficiency_rechecked": sufficiency_rechecked,
-                "sufficient_after_batch": bool(
-                    (sufficiency or {}).get("sufficient", False)
-                ),
-                "missing_aspects_after_batch": list(
-                    (sufficiency or {}).get("missing_aspects", [])
-                ),
-                "frontier_priority": state.get("last_frontier_priority"),
-                "frontier_route_score": state.get("last_frontier_route_score"),
-                "frontier_local_norm": state.get("last_frontier_local_norm"),
-                "frontier_ranking_policy": state.get("last_frontier_policy", "primary"),
-                "evidence_api_calls_added": (
-                    stats_after["evidence_batch_api_calls"]
-                    - stats_before["evidence_batch_api_calls"]
-                ),
-                "sufficiency_api_calls_added": (
-                    stats_after["sufficiency_api_calls"]
-                    - stats_before["sufficiency_api_calls"]
-                ),
-                "elapsed_seconds": round(elapsed, 4),
-            }
-        )
-        return prioritized_evidence, sufficiency, faq_added
-
-    # ------------------------------------------------------------------
-    # Final answer
-    # ------------------------------------------------------------------
-
-    def _answer_policy(self, sufficiency):
-        rule_sensitive = bool(sufficiency.get("rule_sensitive", False))
-        conflict = sufficiency.get("conflict_resolution", {}) or {}
-        conflict_status = str(conflict.get("status", "none"))
-        retrieval_sufficient = bool(sufficiency.get("sufficient", False))
-
-        allow_knowledge = bool(
-            getattr(self.config, "allow_knowledge_assisted_answer", True)
-        )
-        if (
-            rule_sensitive
-            and bool(
-                getattr(
-                    self.config,
-                    "block_knowledge_assist_for_rule_sensitive",
-                    True,
-                )
-            )
-        ):
-            allow_knowledge = False
-        if conflict_status == "unresolved":
-            allow_knowledge = False
-
-        if retrieval_sufficient:
-            mode = (
-                "evidence_compositional"
-                if sufficiency.get("coverage_mode") in {"evidence_compositional", "compositional"}
-                else "evidence_grounded"
-            )
-        elif conflict_status == "unresolved":
-            mode = "librarian_review_conflict"
-        elif rule_sensitive:
-            mode = "abstain_rule_sensitive"
-        elif allow_knowledge:
-            mode = "knowledge_assisted_allowed"
-        else:
-            mode = "abstain_insufficient"
-
         return {
-            "mode": mode,
-            "retrieval_sufficient": retrieval_sufficient,
-            "rule_sensitive": rule_sensitive,
-            "knowledge_assist_allowed": allow_knowledge,
-            "coverage_mode": sufficiency.get("coverage_mode", "insufficient"),
-            "evidence_relationship": sufficiency.get(
-                "evidence_relationship", "unknown"
-            ),
-            "conflict_status": conflict_status,
-            "preferred_evidence_ids": conflict.get(
-                "preferred_evidence_ids", []
-            ),
-            "superseded_evidence_ids": conflict.get(
-                "superseded_evidence_ids", []
-            ),
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": statuses},
+                "answer": {"type": "string"},
+                "missing": {"type": "string"},
+                "refinement_query": {"type": "string"},
+                "evidence_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": allowed_ids},
+                },
+                "knowledge_used": {"type": "boolean"},
+            },
+            "required": [
+                "status",
+                "answer",
+                "missing",
+                "refinement_query",
+                "evidence_ids",
+                "knowledge_used",
+            ],
         }
 
-    def _answer(self, query, context_pack, sufficiency, answer_policy):
-        system = """你是國家圖書館領域的最終問答模型。你必須區分「檢索證據可支持的內容」與「模型自行推測」。
+    def _answer_once(self, query, evidence, source_evidence=None, allow_partial=True):
+        ids = [
+            str(x.get("atomic_id", "")).strip()
+            for x in evidence
+            if str(x.get("atomic_id", "")).strip()
+        ]
 
-核心規則：
-1. 先依 Evidence Context 回答；不可把 background/相似案例類比成新的正式編目規則。
-2. 若 retrieval sufficient=false 且 rule_sensitive=true（例如 MARC/RDA 欄位、指標、分欄、代碼、分類/作者號等正式規則），不得用模型常識補成確定答案；只回答 evidence 已支持的部分，並明確指出尚缺哪個規則。
-3. 若 conflict_status=resolved_by_date，優先採用 Python 已標出的 preferred_evidence_ids；較舊的 conflicting evidence 只作歷史/差異說明，不可與最新規則並列成同等答案。
-4. 若 conflict_status=unresolved，不得自行選邊；明確告知現有資料在相同適用條件下有不一致，交由館員依最新版正式規範確認。
-5. conditional 不是 conflict。若 evidence 因適用條件不同而答案不同，應把條件說清楚。
-6. 非 rule-sensitive 且允許 knowledge assist 時，若使用模型知識，必須明確寫「以下補充未由本次檢索證據直接驗證：」；不得偽造 evidence ID。
-7. 使用者端不要輸出 direct/supporting 等內部 relevance 標籤，也不要輸出「知識充分性：直接支持」。館員只需要答案、依據，以及必要的推論/衝突/不足提醒。
-8. 證據 ID 只能引用 Context 中真正存在者。
-9. 若 evidence 涉及數字、碼數、位址、指標值、分欄順序、固定格式或逐項操作規則，必須忠實保留 evidence 的明確內容；不得在改寫或摘要時自行改變數值、碼數、位置或條件。若文字敘述與 evidence 中的具體範例看似不一致，不得自行猜測，應只陳述 evidence 可確認的部分。
-"""
+        # Source-level context may contain relevant siblings that did not fit
+        # into the atomic Top-K. Allow those IDs in the grounded citation set.
+        for source in source_evidence or []:
+            for atom in source.get("atomics", []):
+                atomic_id = str(atom.get("atomic_id", "")).strip()
+                if atomic_id and atomic_id not in ids:
+                    ids.append(atomic_id)
 
-        conflict = sufficiency.get("conflict_resolution", {}) or {}
-        missing = sufficiency.get("missing_aspects", []) or []
-        policy_text = (
-            f"mode={answer_policy.get('mode')}\n"
-            f"retrieval_sufficient={answer_policy.get('retrieval_sufficient')}\n"
-            f"rule_sensitive={answer_policy.get('rule_sensitive')}\n"
-            f"knowledge_assist_allowed={answer_policy.get('knowledge_assist_allowed')}\n"
-            f"coverage_mode={answer_policy.get('coverage_mode')}\n"
-            f"evidence_relationship={answer_policy.get('evidence_relationship')}\n"
-            f"conflict_status={answer_policy.get('conflict_status')}\n"
-            f"preferred_evidence_ids={answer_policy.get('preferred_evidence_ids')}\n"
-            f"superseded_evidence_ids={answer_policy.get('superseded_evidence_ids')}"
+        source_context = self._source_evidence_context(source_evidence)
+
+        # If source-level completeness is active, the selected source family is
+        # the primary synthesis view.  Remove duplicate atomics from the normal
+        # Top-K context and place the complete source first.  Atomic retrieval
+        # still selected/validated this source; this only changes what the
+        # Answer/Judge sees first.
+        source_atomic_ids = {
+            str(atom.get("atomic_id", "")).strip()
+            for source in (source_evidence or [])
+            for atom in source.get("atomics", [])
+            if str(atom.get("atomic_id", "")).strip()
+        }
+        supporting_evidence = [
+            item
+            for item in evidence
+            if str(item.get("atomic_id", "")).strip() not in source_atomic_ids
+        ]
+        atomic_context = self._evidence_context(
+            supporting_evidence if source_context else evidence
         )
-        sufficiency_text = (
-            f"query_aspects={sufficiency.get('query_aspects', [])}\n"
-            f"covered_aspects={sufficiency.get('covered_aspects', [])}\n"
-            f"missing_aspects={missing}\n"
-            f"reason={sufficiency.get('reason', '')}\n"
-            f"conflict_groups={conflict.get('groups', [])}"
-        )
 
-        user = f"""請回答以下問題：
+        context_parts = []
+        if source_context:
+            context_parts.append(
+                "=== PRIMARY Source-level FAQ evidence（完整集合/原始語境）===\n"
+                "這是集合型問題的主要完整性來源。回答前必須逐項檢視此 SOURCE "
+                "中的每一個 atomic unit；不要只回答最相似的前幾項。\n"
+                + source_context
+            )
+        if atomic_context:
+            label = (
+                "=== Secondary atomic evidence（其他補充證據）===\n"
+                if source_context
+                else "=== Atomic evidence（精準檢索）===\n"
+            )
+            context_parts.append(label + atomic_context)
+
+        context = "\n\n".join(context_parts)
+        schema = self._answer_schema(ids, allow_partial=allow_partial)
+
+        if allow_partial:
+            status_instructions = """請選擇 status：
+- grounded：核心答案可由目前 evidence 直接支持或安全組合支持。knowledge_used=false。
+- partial：目前 evidence 尚不足以直接支持完整答案。即使你知道答案，也不得使用模型知識；請填 missing 與一個精準 refinement_query，讓系統先再查資料庫一次。
+
+本輪禁止 knowledge_fallback。資料庫不足時必須回 partial，而不是直接用模型知識回答。"""
+            final_instruction = (
+                "這是第一輪檢索判斷。只做 evidence-grounded 判斷或提出 refinement；"
+                "不得以模型既有知識補答。"
+            )
+        else:
+            status_instructions = """請選擇 status：
+- grounded：核心答案可由目前 evidence 直接支持或安全組合支持。knowledge_used=false。
+- knowledge_fallback：已完成一次 refinement 後，資料庫仍不足以完整回答；此時才可使用模型知識回答，knowledge_used=true，而且必須清楚標示哪些內容未由本次資料庫直接驗證。"""
+            final_instruction = (
+                "這是 refinement 後的最終判斷。若資料庫仍不完整，不可再回 partial；"
+                "才可使用 knowledge_fallback，並把資料庫可確認內容與模型知識補充分開。"
+            )
+
+        prompt = f"""你是國家圖書館 Tree-RAG 的 Answer/Judge。
+
+使用者問題：
 {query}
 
-Answer Policy（系統內部判斷，只用來約束回答，不要逐欄照抄）：
-{policy_text}
+本次資料庫檢索 evidence：
+{context if context else '(沒有檢索到 evidence)'}
 
-Evidence Sufficiency / Conflict Trace：
-{sufficiency_text}
+{status_instructions}
 
-以下是 Tree-Guided Progressive RAG 建立的最終 Knowledge Pack：
-{context_pack}
+規則：
+1. evidence 中的正式規則、數字、碼數、位址、indicator、subfield、年份、順序與條件不得被改寫成不同內容。
+2. 不得為了調和不同 evidence 自行創造 evidence 沒寫出的「比例、顯著程度、主從門檻、例外或適用條件」。
+3. 使用者若指定 MARC/RDA 欄位、位址、indicator 或 subfield，不能用其他欄位的相近規則冒充直接證據。
+4. 枚舉/有哪些/還有其他/除了某項之外類問題，要整合目前 evidence 中所有明確支持的選項；不要只列第一個。
+   若有 PRIMARY Source-level FAQ evidence：
+   - 先逐一檢視該 SOURCE 中「每一個」atomic unit，再作答。
+   - 使用者明確排除的項目不要列入答案。
+   - 其餘凡直接符合問題條件的項目都要納入；不得因為前兩三項語意較相似就停止。
+   - grounded 的 evidence_ids 應包含實際支持答案各項目的 source atomic_id。
+5. evidence_ids 只能填上方實際存在的 atomic_id。
+6. grounded 時不要加入模型既有知識。
+7. knowledge_fallback 時，答案中必須出現「【模型知識補充｜未由本次資料庫直接驗證】」。若 evidence 有可確認部分，可先列「資料庫可確認」再補充。
+8. partial 的 refinement_query 應使用原問題的精確 constraint + missing aspect；不得把你猜測的答案值塞進搜尋詞。
+9. 回答使用繁體中文，直接回答館員問題，不輸出內部 reasoning。
 
-請使用以下格式：
-分類路徑：
-回答：
-判斷依據：
-證據來源：
-注意事項：
-
-注意事項的規則：
-- 正常且無特殊風險時寫「無」。
-- 若是 evidence 組合推論，簡短說明「此結論由多筆既有證據組合得出」。
-- 若 evidence 不足，列出真正缺少的規則/資訊。
-- 若有 unresolved conflict，列出衝突與需館員確認之處。
-- 不要輸出 direct/supporting/知識充分性 等內部標籤。
+{final_instruction}
 """
 
-        answer_think = False if self.service_mode else bool(self.config.answer_think)
-        return self.answer_llm.chat_text(
+        result = self.answer_llm.chat_json(
             self.config.answer_model,
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-            think=answer_think,
+            [{"role": "user", "content": prompt}],
+            schema,
+            temperature=0.0,
+            think=self.config.answer_think,
         )
 
+        status = str(result.get("status", "")).strip()
+        knowledge_used = bool(result.get("knowledge_used", False))
+
+        # Deterministic lifecycle guard:
+        #   pass 1  -> grounded | partial
+        #   pass 2  -> grounded | knowledge_fallback
+        # Do not rely only on the LLM following the enum because some
+        # OpenAI-compatible backends return JSON without schema enforcement.
+        if allow_partial:
+            if status != "grounded" or knowledge_used:
+                status = "partial"
+                knowledge_used = False
+                # A model-generated fallback answer from pass 1 is deliberately
+                # discarded; it must not become user-facing before DB refinement.
+                result["answer"] = ""
+        else:
+            if status != "grounded":
+                status = "knowledge_fallback"
+                knowledge_used = True
+            elif knowledge_used:
+                status = "knowledge_fallback"
+                knowledge_used = True
+
+        allowed = set(ids)
+        result["evidence_ids"] = [
+            str(x).strip()
+            for x in result.get("evidence_ids", [])
+            if str(x).strip() in allowed
+        ]
+        result["status"] = status
+        result["knowledge_used"] = status == "knowledge_fallback" or knowledge_used
+
+        if allow_partial and status == "partial":
+            missing = str(result.get("missing", "")).strip()
+            refinement_query = str(result.get("refinement_query", "")).strip()
+            if not missing:
+                missing = "目前資料庫 evidence 尚不足以直接支持完整答案"
+            if not refinement_query:
+                refinement_query = f"{query} {missing}".strip()
+            result["missing"] = missing
+            result["refinement_query"] = refinement_query
+
+        answer = str(result.get("answer", "")).strip()
+        if result["status"] == "knowledge_fallback" and self.config.allow_model_knowledge_fallback:
+            marker = "【模型知識補充｜未由本次資料庫直接驗證】"
+            if marker not in answer:
+                answer = f"{marker}\n{answer}".strip()
+        result["answer"] = answer
+        return result
+
     # ------------------------------------------------------------------
-    # Offline static knowledge
+    # Gap logging for later DB curation
     # ------------------------------------------------------------------
 
-    def build_static_knowledge_packs(
-        self,
-        force_rebuild=False,
-        include_l2_parents=True,
-    ):
-        return self.knowledge_store.build_all(
-            self.knowledge_loader,
-            include_l2_parents=include_l2_parents,
-            force_rebuild=force_rebuild,
-        )
-
-    def build_node_summaries(
-        self,
-        force_rebuild=False,
-        include_l2_parents=True,
-    ):
-        return self.build_static_knowledge_packs(
-            force_rebuild=force_rebuild,
-            include_l2_parents=include_l2_parents,
-        )
+    def _log_gap(self, query, initial, final, paths, evidence, refinement_used):
+        queue_path = Path(self.config.fallback_queue_path)
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "query": query,
+            "initial_status": initial.get("status"),
+            "final_status": final.get("status"),
+            "initial_missing": initial.get("missing", ""),
+            "refinement_query": initial.get("refinement_query", ""),
+            "refinement_used": bool(refinement_used),
+            "knowledge_used": bool(final.get("knowledge_used", False)),
+            "routed_paths": [p.display() for p in paths],
+            "evidence_ids": [x.get("atomic_id", "") for x in evidence],
+            "answer": final.get("answer", ""),
+            "review_status": "pending",
+        }
+        with queue_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # ------------------------------------------------------------------
-    # Main query pipeline
+    # Public run
     # ------------------------------------------------------------------
 
-    def run(
-        self,
-        query,
-        l1_beam=None,
-        l2_beam=None,
-        final_beam=None,
-        force_rebuild_summaries=False,
-        force_rebuild_knowledge=None,
-        final_context_unit_limit=None,
-    ):
-        total_t0 = time.perf_counter()
-        self.evidence_selector.reset_stats()
-
-        query = str(query).strip()
+    def run(self, query, **_compat_kwargs):
+        query = str(query or "").strip()
         if not query:
             raise ValueError("query 不可為空")
 
-        l1_beam = (
-            self.config.l1_beam
-            if l1_beam is None
-            else l1_beam
-        )
-        l2_beam = (
-            self.config.l2_beam
-            if l2_beam is None
-            else l2_beam
-        )
-        final_beam = (
-            self.config.final_beam
-            if final_beam is None
-            else final_beam
-        )
-
-        if final_context_unit_limit is None:
-            final_context_unit_limit = (
-                self.config.final_context_unit_limit
-            )
-
-        # Older config.py uses 0 = unlimited. Service Mode caps final context
-        # by default so Final Answer latency remains bounded.
-        if (
-            self.service_mode
-            and (
-                final_context_unit_limit is None
-                or int(final_context_unit_limit) <= 0
-            )
-        ):
-            final_context_unit_limit = self._service_int(
-                "service_final_context_unit_limit",
-                12,
-                minimum=1,
-            )
-
-        if force_rebuild_knowledge is None:
-            force_rebuild_knowledge = bool(
-                force_rebuild_summaries
-            )
-
-        timings = {}
-
-        # --------------------------------------------------------------
-        # 1) Tree-first routing
-        # --------------------------------------------------------------
         t0 = time.perf_counter()
 
-        paths = self.router.route_tree(
+        # Planner is remote; global and FAQ retrieval are local and independent.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            plan_future = pool.submit(self.router.plan, query)
+            global_future = pool.submit(self._global_hits, query)
+            faq_future = pool.submit(self._faq_hits, query)
+            plan = plan_future.result()
+            global_hits = global_future.result()
+            faq_hits = faq_future.result()
+
+        # Completeness intent is local and orthogonal to Tree routing.
+        answer_scope = self._answer_scope(query)
+
+        t_plan_parallel = time.perf_counter()
+
+        tree_hits, rewrite_global = self._initial_retrieve(query, plan)
+        # Provenance completion follows the lexical rescue channels. Global
+        # hits are direct query matches across the whole DB; using them as FAQ
+        # anchors avoids a broad Tree node flooding provenance with unrelated
+        # siblings while still repairing atomic fragmentation.
+        provenance_hits = self._provenance_hits(
             query,
-            l1_beam=l1_beam,
-            l2_global_beam=l2_beam,
-            final_beam=final_beam,
+            global_hits,
+            rewrite_global,
+            tree_hits,
         )
-
-        timings["routing"] = time.perf_counter() - t0
-
-        if not paths:
-            raise RuntimeError(
-                "Tree Router 未回傳任何候選路徑"
-            )
-
-        # --------------------------------------------------------------
-        # 2) Build routed node states locally
-        # --------------------------------------------------------------
-        t0 = time.perf_counter()
-
-        states = []
-        state_by_key = {}
-        routed_path_by_key = {}
-
-        for rank, path in enumerate(paths):
-            key = self._path_key(path)
-            routed_path_by_key[key] = path
-
-            if key in state_by_key:
-                continue
-
-            role = (
-                "primary"
-                if rank == 0
-                else "alternative"
-            )
-            origin = (
-                "primary"
-                if rank == 0
-                else "routed_alternative"
-            )
-
-            pack = self._load_path_pack(
-                path,
-                role=role,
-                force_rebuild=force_rebuild_knowledge,
-            )
-
-            state = self._make_state(
-                pack,
-                route_score=path.score,
-                origin=origin,
-                source_path=path,
-            )
-
-            states.append(state)
-            state_by_key[key] = state
-
-        timings["frontier_prepare"] = (
-            time.perf_counter() - t0
+        evidence = self._merge_hits(
+            tree_hits,
+            global_hits,
+            rewrite_global,
+            faq_hits,
+            provenance_hits,
+            limit=self.config.context_limit,
         )
-
-        primary_state = state_by_key[
-            self._path_key(paths[0])
-        ]
-
-        knowledge_packs = []
-        opened_pack_keys = set()
-        prioritized_evidence = []
-        sufficiency = None
-        sufficiency_initial = None
-        faq_packs = []
-        faq_added_total = 0
-        progressive_history = []
-        sibling_expansion_paths = []
-        service_stop_reason = ""
-
-        # --------------------------------------------------------------
-        # 3) Mandatory primary-node first batch
-        # --------------------------------------------------------------
-        t0 = time.perf_counter()
-
-        (
-            prioritized_evidence,
-            sufficiency,
-            faq_added,
-        ) = self._assess_one_progressive_batch(
+        source_evidence = self._source_evidence_for_set_query(
             query,
-            primary_state,
-            prioritized_evidence,
-            sufficiency,
-            knowledge_packs,
-            opened_pack_keys,
-            faq_packs,
-            progressive_history,
+            evidence,
+            answer_scope,
         )
+        t_retrieval = time.perf_counter()
 
-        faq_added_total += faq_added
+        initial = self._answer_once(
+            query,
+            evidence,
+            source_evidence=source_evidence,
+            allow_partial=self.config.enable_refinement,
+        )
+        t_first_answer = time.perf_counter()
 
-        if sufficiency is None:
-            sufficiency = self._check_sufficiency(
-                query,
-                prioritized_evidence,
-            )
+        final = initial
+        refinement_used = False
+        refinement_trace = None
+        final_paths = list(plan["paths"])
 
-        sufficiency_initial = sufficiency
-
-        # Only expand sibling L3 candidates if the first primary batch
-        # did not provide sufficient evidence.
         if (
-            not sufficiency.get("sufficient", False)
-            and primary_state["pack"].get("l3")
-            and not primary_state.get("family_expanded")
+            self.config.enable_refinement
+            and initial.get("status") == "partial"
         ):
-            added_states = self._add_sibling_states(
-                primary_state,
-                states,
-                state_by_key,
-                routed_path_by_key,
-                force_rebuild=force_rebuild_knowledge,
-            )
-
-            sibling_expansion_paths.extend(
-                state["pack"].get("path", "")
-                for state in added_states
-            )
-
-        timings["primary_probe"] = (
-            time.perf_counter() - t0
-        )
-
-        # --------------------------------------------------------------
-        # 4) Progressive frontier
-        # --------------------------------------------------------------
-        t0 = time.perf_counter()
-
-        while not sufficiency.get("sufficient", False):
-            if self.service_mode:
-                elapsed_total = (
-                    time.perf_counter() - total_t0
-                )
-
-                max_steps = self._service_int(
-                    "service_max_progressive_steps",
-                    3,
-                    minimum=1,
-                )
-
-                search_budget = self._service_float(
-                    "service_search_budget_seconds",
-                    38.0,
-                    minimum=1.0,
-                )
-
-                # progressive_history already includes the first primary batch.
-                if len(progressive_history) >= max_steps:
-                    service_stop_reason = (
-                        "max_progressive_steps"
-                    )
-                    break
-
-                if elapsed_total >= search_budget:
-                    service_stop_reason = (
-                        "search_time_budget"
-                    )
-                    break
-
-            focus = self._focus_text(
-                query,
-                sufficiency,
-                prioritized_evidence,
-            )
-
-            ranked_frontier = self._frontier_priority(
-                query,
-                states,
-                focus,
-            )
-
-            # Service Mode prevents repeatedly scanning a large node and
-            # opening many alternative/sibling nodes online.
-            if self.service_mode:
-                max_batches_per_node = self._service_int(
-                    "service_max_batches_per_node",
-                    2,
-                    minimum=1,
-                )
-
-                max_nonprimary_nodes = self._service_int(
-                    "service_max_nonprimary_nodes",
-                    2,
-                    minimum=0,
-                )
-
-                opened_nonprimary_keys = {
-                    state.get("key")
-                    for state in states
-                    if (
-                        state.get("opened")
-                        and state.get("origin") != "primary"
-                    )
-                }
-                filtered_frontier = []
-                for item in ranked_frontier:
-                    candidate_state = item["state"]
-                    if int(candidate_state.get("batches", 0)) >= max_batches_per_node:
-                        continue
-                    if candidate_state.get("origin") != "primary":
-                        candidate_key = candidate_state.get("key")
-                        is_new_nonprimary = candidate_key not in opened_nonprimary_keys
-                        if is_new_nonprimary and len(opened_nonprimary_keys) >= max_nonprimary_nodes:
-                            continue
-                    filtered_frontier.append(item)
-                ranked_frontier = filtered_frontier
-
-            if not ranked_frontier:
-                service_stop_reason = (
-                    "service_frontier_limit"
-                    if self.service_mode
-                    else "frontier_exhausted"
-                )
-                break
-
-            chosen = ranked_frontier[0]
-            state = chosen["state"]
-            state["last_frontier_priority"] = chosen.get("priority")
-            state["last_frontier_route_score"] = chosen.get("route_score")
-            state["last_frontier_local_norm"] = chosen.get("local_norm")
-            state["last_frontier_policy"] = chosen.get("ranking_policy", "")
+            refinement_used = True
+            refinement_query = str(initial.get("refinement_query", "")).strip()
+            if not refinement_query:
+                missing = str(initial.get("missing", "")).strip()
+                refinement_query = f"{query} {missing}".strip()
 
             (
-                prioritized_evidence,
-                sufficiency,
-                faq_added,
-            ) = self._assess_one_progressive_batch(
+                final_paths,
+                refine_tree,
+                refine_global,
+                refine_faq,
+                refinement_trace,
+            ) = self._refinement_retrieve(
                 query,
-                state,
-                prioritized_evidence,
-                sufficiency,
-                knowledge_packs,
-                opened_pack_keys,
-                faq_packs,
-                progressive_history,
+                refinement_query,
+                str(initial.get("missing", "")).strip(),
+                plan["paths"],
+                evidence,
             )
 
-            faq_added_total += faq_added
-
-            if sufficiency.get("sufficient", False):
-                service_stop_reason = "sufficient"
-                break
-
-            # Once a routed/sibling L3 actually receives a batch,
-            # add its sibling family lazily.
-            if (
-                state["pack"].get("l3")
-                and not state.get("family_expanded")
-            ):
-                added_states = self._add_sibling_states(
-                    state,
-                    states,
-                    state_by_key,
-                    routed_path_by_key,
-                    force_rebuild=force_rebuild_knowledge,
-                )
-
-                sibling_expansion_paths.extend(
-                    child["pack"].get("path", "")
-                    for child in added_states
-                )
-
-        timings["progressive_tree_search"] = (
-            time.perf_counter() - t0
-        )
-
-        # --------------------------------------------------------------
-        # 5) Final safety net
-        # --------------------------------------------------------------
-        fallback_pack = None
-        fallback_added = 0
-        t0 = time.perf_counter()
-
-        allow_fallback = True
-
-        if self.service_mode:
-            fallback_cutoff = self._service_float(
-                "service_fallback_cutoff_seconds",
-                42.0,
-                minimum=1.0,
+            refine_provenance = self._provenance_hits(
+                refinement_query,
+                refine_global,
+                refine_faq,
+                refine_tree,
             )
-
-            elapsed_before_fallback = (
-                time.perf_counter() - total_t0
+            refined_evidence = self._merge_hits(
+                # Keep first-round evidence in the candidate pool by recreating a
+                # lightweight provenance channel from their indices.
+                [
+                    {
+                        "idx": x["idx"],
+                        "bm25": x.get("bm25", 0.0),
+                        "channel": "first_round",
+                        "channel_rank": i,
+                        "route_rank": None,
+                        "route_score": 0.0,
+                        "path": "FIRST_ROUND",
+                    }
+                    for i, x in enumerate(evidence, start=1)
+                ],
+                refine_tree,
+                refine_global,
+                refine_faq,
+                refine_provenance,
+                limit=self.config.refinement_context_limit,
             )
-
-            if elapsed_before_fallback >= fallback_cutoff:
-                allow_fallback = False
-                if not service_stop_reason:
-                    service_stop_reason = (
-                        "fallback_skipped_time_budget"
-                    )
-
-        if (
-            not sufficiency.get("sufficient", False)
-            and allow_fallback
-        ):
-            force_fallback = bool(
-                self.config.fallback_on_tree_exhausted
-            )
-
-            fallback_pack = self._fallback_pack(
+            evidence = refined_evidence
+            source_evidence = self._source_evidence_for_set_query(
                 query,
-                paths,
-                force=force_fallback,
+                evidence,
+                answer_scope,
+            )
+            final = self._answer_once(
+                query,
+                evidence,
+                source_evidence=source_evidence,
+                allow_partial=False,
             )
 
-            if fallback_pack is not None:
-                self._register_pack(
-                    fallback_pack,
-                    knowledge_packs,
-                    opened_pack_keys,
-                )
+        t_final = time.perf_counter()
 
-                before_ids = {
-                    item.get("evidence_id")
-                    for item in prioritized_evidence
-                }
-
-                prioritized_evidence = (
-                    self.evidence_selector.extend_prioritized(
-                        query,
-                        prioritized_evidence,
-                        [fallback_pack],
-                    )
-                )
-
-                fallback_added = sum(
-                    1
-                    for item in prioritized_evidence
-                    if (
-                        item.get("evidence_id")
-                        not in before_ids
-                    )
-                )
-
-                if fallback_added:
-                    sufficiency = self._check_sufficiency(
-                        query,
-                        prioritized_evidence,
-                    )
-
-        timings["global_fallback"] = (
-            time.perf_counter() - t0
-        )
-
-        all_prioritized_count = len(
-            prioritized_evidence
-        )
-
-        # --------------------------------------------------------------
-        # 6) Final context + answer
-        # --------------------------------------------------------------
-        final_context_evidence = (
-            self.evidence_selector.filter_for_context(
-                prioritized_evidence,
-                include_background=(
-                    self.config.final_include_background
-                ),
-            )
-        )
-
-        final_context_before_limit = len(
-            final_context_evidence
-        )
-
-        if (
-            final_context_unit_limit
-            and final_context_unit_limit > 0
-        ):
-            final_context_evidence = (
-                final_context_evidence[
-                    :final_context_unit_limit
-                ]
+        # Initial non-grounded status is itself a useful DB-gap signal, even if
+        # refinement later succeeds from a different slice of the same database.
+        if initial.get("status") != "grounded" or final.get("knowledge_used"):
+            self._log_gap(
+                query,
+                initial,
+                final,
+                final_paths,
+                evidence,
+                refinement_used,
             )
 
-        t0 = time.perf_counter()
-
-        context_pack = self.context_builder.build(
-            query,
-            paths,
-            knowledge_packs,
-            final_context_evidence,
-        )
-
-        answer_policy = self._answer_policy(sufficiency)
-        answer = self._answer(
-            query,
-            context_pack,
-            sufficiency,
-            answer_policy,
-        )
-
-        timings["final_answer"] = (
-            time.perf_counter() - t0
-        )
-        timings["total"] = (
-            time.perf_counter() - total_t0
-        )
-
-        # --------------------------------------------------------------
-        # Trace / metrics
-        # --------------------------------------------------------------
-        assessed_by_node = {}
-        state_meta = {}
-
-        for state in states:
-            path = state["pack"].get("path", "")
-            assessed_by_node[path] = state.get(
-                "assessed_unique",
-                0,
-            )
-            state_meta[path] = state
-
-        node_knowledge = []
-
-        for pack in knowledge_packs:
-            path = pack.get("path", "")
-            candidate_count = len(
-                pack.get("knowledge_units", [])
-            )
-
-            assessed_count = assessed_by_node.get(
-                path,
-                candidate_count,
-            )
-
-            if pack.get("role") in {
-                "faq_family",
-                "fallback",
-            }:
-                assessed_count = candidate_count
-
-            node_knowledge.append(
-                {
-                    "role": pack.get("role"),
-                    "path": path,
-                    "static_source": pack.get(
-                        "static_source",
-                        "",
-                    ),
-                    "document_count": pack.get(
-                        "document_count",
-                        0,
-                    ),
-                    "date_start": pack.get(
-                        "date_start",
-                        "",
-                    ),
-                    "date_end": pack.get(
-                        "date_end",
-                        "",
-                    ),
-                    "knowledge_unit_count": (
-                        candidate_count
-                    ),
-                    "source_coverage_ratio": pack.get(
-                        "source_coverage_ratio",
-                        0.0,
-                    ),
-                    "coverage_note": pack.get(
-                        "coverage_note",
-                        "",
-                    ),
-                    "cache_hit": pack.get(
-                        "cache_hit",
-                        False,
-                    ),
-                    "assessed_unit_count": (
-                        assessed_count
-                    ),
-                    "assessment_coverage_ratio": (
-                        assessed_count / candidate_count
-                        if candidate_count
-                        else 0.0
-                    ),
-                }
-            )
-
-        frontier_remaining = sum(
-            len(state.get("remaining_units", []))
-            for state in states
-        )
-
-        frontier_total_candidates = sum(
-            len(
-                state["pack"].get(
-                    "knowledge_units",
-                    [],
-                )
-            )
-            for state in states
-        )
+        timing = {
+            "planner_plus_parallel_local_retrieval": round(t_plan_parallel - t0, 4),
+            "tree_merge_retrieval": round(t_retrieval - t_plan_parallel, 4),
+            "first_answer_judge": round(t_first_answer - t_retrieval, 4),
+            "refinement_and_final_answer": round(t_final - t_first_answer, 4),
+            "total": round(t_final - t0, 4),
+        }
 
         return {
-            "query": query,
+            "answer": final.get("answer", ""),
+            "mode": final.get("status", "knowledge_fallback"),
+            "knowledge_used": bool(final.get("knowledge_used", False)),
+            "initial_decision": initial,
+            "final_decision": final,
+            "answer_scope": answer_scope,
+            "refinement_used": refinement_used,
+            "refinement": refinement_trace,
+            "planner": {
+                "query_focus": plan.get("query_focus", ""),
+                "search_query": plan.get("search_query", query),
+                "fallback": bool(plan.get("fallback", False)),
+            },
             "paths": [
                 {
-                    "path": path.display(),
-                    "score": path.score,
-                    "trace": path.trace,
+                    "path": p.display(),
+                    "score": float(p.score),
+                    "trace": p.trace,
                 }
-                for path in paths
+                for p in final_paths
             ],
-            "node_knowledge": node_knowledge,
-            "node_summaries": node_knowledge,
-            "evidence": prioritized_evidence,
-            "final_context_evidence": (
-                final_context_evidence
-            ),
-            "sufficiency": {
-                "after_primary_probe": (
-                    sufficiency_initial
-                ),
-                "final": sufficiency,
-            },
-            "parent_fallback": {
-                "triggered": bool(
-                    sibling_expansion_paths
-                ),
-                "reason": (
-                    "replaced by progressive sibling-L3 expansion; "
-                    "no whole-L2 parent pack"
-                    if sibling_expansion_paths
-                    else "not needed"
-                ),
-                "added_unique_evidence": sum(
-                    state.get(
-                        "assessed_unique",
-                        0,
-                    )
-                    for state in states
-                    if (
-                        state.get("origin")
-                        == "sibling_l3"
-                    )
-                ),
-                "path": "",
-                "route_uncertain": False,
-            },
-            "sibling_expansion": {
-                "triggered": bool(
-                    sibling_expansion_paths
-                ),
-                "candidate_paths_added": list(
-                    dict.fromkeys(
-                        sibling_expansion_paths
-                    )
-                ),
-                "opened_paths": [
-                    state["pack"].get(
-                        "path",
-                        "",
-                    )
-                    for state in states
-                    if (
-                        state.get("origin")
-                        == "sibling_l3"
-                        and state.get("opened")
-                    )
+            "source_retrieval": {
+                "source_count": len(source_evidence),
+                "sources": [
+                    {
+                        "source_id": x.get("source_id", ""),
+                        "faq_id": x.get("faq_id", ""),
+                        "faq_score": x.get("faq_score", 0.0),
+                        "atomic_hit_count": x.get("atomic_hit_count", 0),
+                        "best_atomic_rank": x.get("best_atomic_rank", 0),
+                        "channels": x.get("channels", []),
+                        "atomic_ids": [
+                            a.get("atomic_id", "")
+                            for a in x.get("atomics", [])
+                        ],
+                        "synthesis_priority": "primary",
+                    }
+                    for x in source_evidence
                 ],
             },
-            "faq_expansion": self._faq_trace(
-                faq_packs,
-                faq_added_total,
-            ),
-            "progressive_search": {
-                "batch_size": (
-                    self._progressive_batch_size()
-                ),
-                "service_mode": self.service_mode,
-                "service_stop_reason": (
-                    service_stop_reason
-                ),
-                "service_search_budget_seconds": (
-                    self._service_float(
-                        "service_search_budget_seconds",
-                        38.0,
-                        minimum=1.0,
-                    )
-                    if self.service_mode
-                    else None
-                ),
-                "service_max_progressive_steps": (
-                    self._service_int(
-                        "service_max_progressive_steps",
-                        3,
-                        minimum=1,
-                    )
-                    if self.service_mode
-                    else None
-                ),
-                "service_max_batches_per_node": (
-                    self._service_int(
-                        "service_max_batches_per_node",
-                        2,
-                        minimum=1,
-                    )
-                    if self.service_mode
-                    else None
-                ),
-                "service_max_nonprimary_nodes": (
-                    self._service_int(
-                        "service_max_nonprimary_nodes",
-                        2,
-                        minimum=0,
-                    )
-                    if self.service_mode
-                    else None
-                ),
-                "embedding_enabled_online": (
-                    self.retriever.use_embedding
-                ),
-                "history": progressive_history,
-                "frontier_node_count": len(states),
-                "frontier_total_candidate_units": (
-                    frontier_total_candidates
-                ),
-                "frontier_remaining_unassessed_units": (
-                    frontier_remaining
-                ),
-                "stopped_early": bool(
-                    (
-                        sufficiency.get(
-                            "sufficient",
-                            False,
-                        )
-                        or self.service_mode
-                    )
-                    and frontier_remaining > 0
-                ),
-                "local_ordering_is_hard_filter": False,
-                "frontier_policy": (
-                    "routed alternatives by Router score; same-parent L3 siblings "
-                    "use discounted parent score + bounded local BM25 signal"
-                ),
-                "visited_path_sequence": [
-                    item.get("path", "")
-                    for item in progressive_history
+            "retrieval": {
+                "evidence_count": len(evidence),
+                "evidence": [
+                    {
+                        "rank": x["rank"],
+                        "atomic_id": x.get("atomic_id", ""),
+                        "faq_id": x.get("faq_id", ""),
+                        "question_date": x.get("question_date", ""),
+                        "question": x.get("question", ""),
+                        "answer": x.get("answer", ""),
+                        "channels": x.get("channels", []),
+                        "retrieved_paths": x.get("retrieved_paths", []),
+                        "retrieval_score": x.get("retrieval_score", 0.0),
+                    }
+                    for x in evidence
                 ],
             },
-            "evidence_evaluation": {
-                "final_unique_evidence": (
-                    all_prioritized_count
-                ),
-                "utility_counts": (
-                    self.evidence_selector.utility_counts(
-                        prioritized_evidence
-                    )
-                ),
-                "final_context_before_limit": (
-                    final_context_before_limit
-                ),
-                "final_context_after_limit": len(
-                    final_context_evidence
-                ),
-                "fallback_added_unique_evidence": (
-                    fallback_added
-                ),
-                **self.evidence_selector.stats(),
-            },
-            "evidence_total_before_context_limit": (
-                all_prioritized_count
-            ),
-            "decision_trace": {
-                **answer_policy,
-                "query_aspects": sufficiency.get("query_aspects", []),
-                "covered_aspects": sufficiency.get("covered_aspects", []),
-                "missing_aspects": sufficiency.get("missing_aspects", []),
-                "conflict_groups": (
-                    sufficiency.get("conflict_resolution", {}) or {}
-                ).get("groups", []),
-            },
-            "timing_seconds": {
-                k: round(v, 4)
-                for k, v in timings.items()
-            },
-            "context_pack": context_pack,
-            "answer": answer,
+            "timing": timing,
         }
