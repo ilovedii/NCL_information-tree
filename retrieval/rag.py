@@ -640,7 +640,34 @@ class TreeGuidedRAG:
                 continue
 
             key = self._node_key(l1, l2, sibling_l3)
+
+            # V3.4.1: merge duplicate routing/sibling identity instead of
+            # silently skipping it.
+            #
+            # A node can already exist because the Router returned it as a
+            # lower-ranked alternative, while it is ALSO a same-parent L3
+            # sibling of the current node. In that case, keeping only the
+            # low Router score loses the hierarchical recovery signal and can
+            # starve the sibling under the Service Mode step budget.
             if key in state_by_key:
+                existing_state = state_by_key[key]
+                existing_route_score = float(
+                    existing_state.get("route_score", 0.0)
+                )
+
+                # Promote only when the inherited sibling score is stronger.
+                # This preserves a genuinely strong Router score when one
+                # already exists, while restoring same-parent recovery for
+                # cases such as T01 Leader/07.
+                if (
+                    existing_state.get("origin") == "routed_alternative"
+                    and inherited_score > existing_route_score
+                ):
+                    existing_state["route_score"] = float(inherited_score)
+                    existing_state["origin"] = "sibling_l3"
+                    existing_state["sibling_promoted_from_routed"] = True
+                    added.append(existing_state)
+
                 continue
 
             routed_path = routed_path_by_key.get(key)
@@ -1026,7 +1053,7 @@ class TreeGuidedRAG:
         if retrieval_sufficient:
             mode = (
                 "evidence_compositional"
-                if sufficiency.get("coverage_mode") == "compositional"
+                if sufficiency.get("coverage_mode") in {"evidence_compositional", "compositional"}
                 else "evidence_grounded"
             )
         elif conflict_status == "unresolved":
@@ -1068,6 +1095,7 @@ class TreeGuidedRAG:
 6. 非 rule-sensitive 且允許 knowledge assist 時，若使用模型知識，必須明確寫「以下補充未由本次檢索證據直接驗證：」；不得偽造 evidence ID。
 7. 使用者端不要輸出 direct/supporting 等內部 relevance 標籤，也不要輸出「知識充分性：直接支持」。館員只需要答案、依據，以及必要的推論/衝突/不足提醒。
 8. 證據 ID 只能引用 Context 中真正存在者。
+9. 若 evidence 涉及數字、碼數、位址、指標值、分欄順序、固定格式或逐項操作規則，必須忠實保留 evidence 的明確內容；不得在改寫或摘要時自行改變數值、碼數、位置或條件。若文字敘述與 evidence 中的具體範例看似不一致，不得自行猜測，應只陳述 evidence 可確認的部分。
 """
 
         conflict = sufficiency.get("conflict_resolution", {}) or {}

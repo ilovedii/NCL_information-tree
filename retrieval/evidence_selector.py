@@ -329,26 +329,66 @@ Knowledge Units：
 
     @staticmethod
     def _is_rule_sensitive_query(query):
-        """Conservative detector for exact cataloguing-rule questions.
+        """Detect formal cataloguing/classification-rule questions conservatively.
 
-        This is intentionally deterministic. It does not decide the answer; it
-        only tells the final-answer layer that unsupported analogy must not be
-        promoted into a formal MARC/RDA/classification rule.
+        The detector is deterministic and intentionally separate from answer
+        generation. A bare three-digit number is not enough; MARC-like field
+        numbers must appear with cataloguing context, unless the query already
+        contains an explicit formal-rule marker such as MARC, RDA, $n, Leader,
+        classification number, etc.
         """
-        text = str(query or "")
-        patterns = [
+        text = str(query or "").strip()
+        if not text:
+            return False
+
+        explicit_rule_patterns = [
             r"\bMARC\s*21\b",
+            r"\bMARC\b",
             r"\bCMARC\b",
             r"\bRDA\b",
             r"\bAACR2?\b",
-            r"\bLeader\b|\bLDR\b",
+            r"\bLeader\b",
+            r"\bLDR\b",
             r"\b00[15678]\b",
-            r"\b\d{3}\b",
             r"\$[0-9A-Za-z]",
-            r"subfield",
-            r"欄位|字段|分欄|子欄位|指標|位址|代碼|著錄規則|編目規則|分類號|作者號|主題標目|複分",
+            r"\bsubfield\b",
+            r"\bindicator\b",
+            r"分類號",
+            r"作者號",
+            r"主題標目",
+            r"複分",
+            r"著錄規則",
+            r"編目規則",
         ]
-        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+        if any(
+            re.search(pattern, text, flags=re.IGNORECASE)
+            for pattern in explicit_rule_patterns
+        ):
+            return True
+
+        # MARC-like 3-digit field number must be accompanied by cataloguing
+        # context. This catches "264 ... 年份著錄" but not "我有264本書".
+        has_field_number = bool(re.search(r"(?<!\d)\d{3}(?!\d)", text))
+        has_catalog_context = bool(
+            re.search(
+                r"欄位|字段|field|分欄|子欄位|指標|位址|"
+                r"著錄|編目|版權年|出版年|代碼|題名|責任者",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        if has_field_number and has_catalog_context:
+            return True
+
+        # Explicit MARC field + indicator notation, e.g. 264 4, 264 #4, 245 10.
+        if re.search(
+            r"(?<!\d)\d{3}\s*#?\s*[0-9#]{1,2}(?!\d)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return True
+
+        return False
 
     @staticmethod
     def _parse_evidence_date(value):
@@ -582,7 +622,7 @@ Knowledge Units：
                 "sufficient": {"type": "boolean"},
                 "coverage_mode": {
                     "type": "string",
-                    "enum": ["evidence_grounded", "compositional", "insufficient"],
+                    "enum": ["evidence_grounded", "evidence_compositional", "insufficient"],
                 },
                 "evidence_relationship": {
                     "type": "string",
@@ -639,28 +679,149 @@ Knowledge Units：
 使用者問題：
 {query}
 
+系統 deterministic 判定：
+rule_sensitive={str(rule_sensitive).lower()}
+若 rule_sensitive=true，必須套用下方所有 rule-sensitive 限制；不得自行把它降級成一般問答。
+
 目前可用 evidence：
 {chr(10).join(blocks)}
 
 判斷規則：
-1. 先把使用者真正要求回答的資訊拆成 query_aspects；只拆實質需求。
-2. sufficient=true 只有在每一個實質 aspect 都可由目前 evidence 支持時才成立。
-3. 允許組合式覆蓋：不同 evidence 可共同建立一個基本比較或結論。
-4. 但若使用者要求正式操作規則、MARC/RDA 欄位/指標/分欄、代碼選擇、分類/作者號規則、版本差異或例外，不得把「相似案例」類比成新的正式規則。缺少該情境的明確規則鏈時必須 insufficient。
-5. constraint alignment 必須嚴格：欄位、位址、格式/版本、實體、代碼角色、關係及適用條件若不一致，不得視為同一規則的直接支持。
+
+1. 先把使用者真正要求回答的資訊拆成 query_aspects；只拆實質需求，不要把同一需求過度細分。
+
+2. sufficient=true 的條件是：
+   每一個「回答核心問題所必要的 aspect」都能由目前 evidence 直接支持，
+   或由多筆 evidence 的明確內容安全組合支持。
+
+3. 不要求某一筆 evidence 必須逐字回答完整問題。
+   不同 evidence 可以共同建立定義、關係、比較、結構或結論。
+
+4. 對正式操作規則、MARC/RDA 欄位/指標/分欄、代碼選擇、
+   分類/作者號規則、版本差異或例外，仍允許 evidence_compositional。
+
+   關鍵不是「是否存在完全相同情境的單一 evidence」，
+   而是：
+   - 所需結論是否可以由 evidence 中已明確存在的定義、關係、
+     結構、規則或多個相互補充的例子建立；
+   - 組合過程是否不需要新增 evidence 未提供的正式規則、
+     例外、條件、門檻或適用範圍。
+
+   如果必須自行補上一條新的正式規則才能完成答案，
+   才必須判 insufficient。
+
+5. constraint alignment 必須嚴格：
+   欄位、位址、格式/版本、實體、代碼角色、關係及適用條件若不一致，
+   不得視為同一規則的直接支持。
+
 6. 多意圖、比較、條件、例外、兩段式問題必須逐項覆蓋。
+   但如果使用者問的是「兩種情況是否有差異」，
+   evidence 已足以證明兩者具有不同結構角色或適用結構時，
+   不要求 evidence 必須逐字出現「兩者有差異」這句話。
+
 7. 枚舉型問題（有哪些、全部、還有其他）不能只找到一例就 sufficient。
+
 8. evidence_relationship 只描述目前 relevant evidence 的整體語意關係：
    - compatible：可以同時成立，沒有實質衝突。
-   - complementary：回答不同部分，可組合。
+   - complementary：回答不同部分，可安全組合。
    - conditional：結論不同是因適用條件不同，並非真正矛盾。
    - conflict：相同規則範圍、相同適用條件下得到互斥結論。
    - unknown：證據不足以判斷關係。
-9. conflict_groups 只列值得稽核的 evidence 組。same_scope=true 只有在格式/欄位/規範/資源類型/適用條件足以視為同一規則範圍時成立。
-10. 不要用日期替 evidence 判定語意上誰對誰錯。日期解析與「最新優先」由 Python 後處理；你只負責判斷是否是真正 same-scope conflict。
-11. coverage_mode=evidence_grounded 表示 evidence 已直接/明確建立規則；compositional 表示多筆 evidence 的明確內容可安全組合、但沒有新增規則；insufficient 表示仍有缺口。
-12. covered_aspects / conflict_groups 的 evidence_ids 只能使用目前提供的 ID。
-13. reason 只寫簡短、可稽核理由，不要輸出詳細思考過程。
+
+9. conflict_groups 只列值得稽核的 evidence 組。
+   same_scope=true 只有在格式/欄位/規範/資源類型/適用條件
+   足以視為同一規則範圍時成立。
+
+10. 不要用日期替 evidence 判定語意上誰對誰錯。
+    日期解析與「最新優先」由 Python 後處理；
+    你只負責判斷是否是真正 same-scope conflict。
+
+11. coverage_mode 只能使用以下三種：
+
+    - evidence_grounded：
+      evidence 已直接或明確建立回答核心問題所需的規則或結論。
+
+    - evidence_compositional：
+      沒有單一 evidence 完整回答問題，
+      但多筆 evidence 的明確內容可以安全組合成核心答案，
+      且組合沒有創造新的正式規則。
+
+    - insufficient：
+      回答核心問題仍需要補上一個 evidence 未支持的關鍵事實、
+      正式規則、適用條件、例外或推測。
+
+12. evidence_compositional 的判定原則：
+
+    可以：
+    - 組合不同 evidence 的明確定義。
+    - 組合不同 evidence 的結構關係。
+    - 組合一般規則與明確例子。
+    - 從多筆 evidence 已明示的關係得出直接結構性結論。
+
+    不可以：
+    - 只因語意相似就推導規則。
+    - 把單一案例提升成普遍規則。
+    - 新增 evidence 沒有提到的例外、門檻或適用條件。
+    - 使用模型既有知識補完正式規範。
+    - 把「可能」自行改成「一定」。
+
+13. 判斷 sufficient 時，要區分「核心結論」與「額外細節」。
+
+    如果 evidence 足以回答使用者的核心問題，
+    但不足以回答某些更細的原因、例外或完整規則，
+    可以：
+    - sufficient=true
+    - coverage_mode=evidence_compositional
+    - 在 reason 中指出哪些細節仍未被 evidence 明確支持。
+
+    不要因為缺少非必要的額外細節，
+    就把整個問題判成 insufficient。
+
+14. 對 rule-sensitive 問題尤其保守：
+
+    如果 sufficient=true 且 coverage_mode=evidence_compositional，
+    每一個核心 claim 都必須可以指出對應 evidence_ids。
+
+    如果某一個核心 claim 需要依賴：
+    - 常識
+    - 模型既有知識
+    - 類比
+    - 猜測
+    - 未提供的正式規則
+
+    則該 aspect 必須視為 uncovered。
+
+15. 對 rule-sensitive 問題，必須區分「一般正式規則」與「具體案例」。
+
+    若使用者詢問的是一般規則，例如：
+    - 某類資料應如何著錄
+    - 某欄位應使用哪個值
+    - 某類資源一般如何處理
+
+    而目前支持核心結論的 evidence 只有單一書目、單一作品、
+    單一案例、範例或「例如」型 evidence：
+
+    - 該 evidence 只能直接支持該具體案例。
+    - 不得僅依該案例把一般規則判為 evidence_grounded。
+    - 不得把該案例自動提升成所有同類資料都適用的通則。
+    - 必須另有 evidence 明確提供一般規則、定義、適用條件，
+      或由多筆 evidence 建立不需新增規則的完整規則鏈，
+      才能判 sufficient=true。
+
+    若只有具體案例而缺少一般規則：
+    - sufficient=false
+    - coverage_mode=insufficient
+    - 該一般規則 aspect 必須列入 missing_aspects
+
+    例外：若使用者詢問的本身就是與該 evidence 相同或等價的
+    具體案例，該案例 evidence 可以直接支持該案例答案。
+
+16. covered_aspects / conflict_groups 的 evidence_ids
+    只能使用目前提供的 ID。
+
+17. reason 只寫簡短、可稽核理由，
+    說明哪些 evidence 支持哪些核心 aspect，
+    不要輸出詳細思考過程。
 """
 
         self._sufficiency_calls += 1
@@ -733,7 +894,14 @@ Knowledge Units：
                 missing_aspects.append(marker)
 
         coverage_mode = str(result.get("coverage_mode", "insufficient")).strip()
-        if coverage_mode not in {"evidence_grounded", "compositional", "insufficient"}:
+        if coverage_mode == "compositional":
+            # Backward compatibility for older traces/models.
+            coverage_mode = "evidence_compositional"
+        if coverage_mode not in {
+            "evidence_grounded",
+            "evidence_compositional",
+            "insufficient",
+        }:
             coverage_mode = "insufficient"
         if not sufficient:
             coverage_mode = "insufficient"

@@ -8,7 +8,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 @dataclass
 class AppConfig:
     csv_path: str = str(
-        PROJECT_DIR / "data" / "llm_retrieval_master.csv"
+        PROJECT_DIR / "data" / "llm_retrieval.csv"
     )
 
     # Ollama stays available as an optional provider.
@@ -106,11 +106,11 @@ class AppConfig:
     # Typical policy:
     # L3 #1 -> L3 #2 -> L3 #3,
     # then stop / fallback if time remains.
-    service_max_progressive_steps: int = 3
+    service_max_progressive_steps: int = 7
 
     # One batch per routed node by default.
     # This prioritizes breadth over repeatedly scanning a wrong L3.
-    service_max_batches_per_node: int = 1
+    service_max_batches_per_node: int = 5
 
     # Allow up to two distinct non-primary nodes in one query.
     # V3.2 effectively locked onto the first non-primary node, which caused
@@ -123,7 +123,7 @@ class AppConfig:
     service_retry_node_on_progress: bool = False
 
     # Stop launching new Evidence-LLM work after this elapsed query time.
-    service_search_budget_seconds: float = 38.0
+    service_search_budget_seconds: float = 200.0
 
     # Global BM25 fallback is only attempted while enough budget remains.
     service_fallback_cutoff_seconds: float = 43.0
