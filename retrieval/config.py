@@ -7,7 +7,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 @dataclass
 class AppConfig:
-    """V4 Simple Tree-RAG configuration.
+    """V4.3 Tree-RAG configuration.
 
     Design goal: two main LLM stages only.
     1) one-shot Tree retrieval planning
@@ -51,6 +51,19 @@ class AppConfig:
     # Global atomic rescue prevents taxonomy/node assignment misses.
     global_top_k: int = 8
     global_rewrite_top_k: int = 4
+
+    # ------------------------------------------------------------------
+    # V4.3 Semantic Atomic Retrieval Units + multi-view BM25
+    # ------------------------------------------------------------------
+    # Each semantic retrieval unit independently searches a focused view and
+    # a keyword view. Retrieval is still local BM25; no extra LLM call is added.
+    unit_global_top_k: int = 6
+    unit_keyword_top_k: int = 6
+
+    # Per-unit evidence quota before cross-unit round-robin merge.
+    # With at most 3 units, 3 x 4 = 12 slots, leaving room under the default
+    # context_limit=16 for original-query rescue evidence.
+    unit_context_top_k: int = 4
 
     # FAQ-level retrieval prevents an original complete answer from being lost
     # after atomic decomposition.

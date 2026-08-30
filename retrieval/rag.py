@@ -12,21 +12,30 @@ from router import RoutePath, TreeRouter
 from taxonomy import TaxonomyIndex
 
 
+OUT_OF_SCOPE_MESSAGE = "您的問題跟編目問題無關。"
+
+
 class TreeGuidedRAG:
-    """V4.1 Simple Tree-RAG.
+    """V4.3 Tree-Guided Hierarchical RAG.
 
     Online flow:
-      1. one-shot Tree planner (one LLM call)
-      2. local multi-channel BM25 retrieval
-         - Tree-local
-         - global atomic rescue
-         - FAQ-level provenance retrieval
-      3. Answer/Judge LLM
-      4. optional ONE evidence-guided refinement retrieval + final Answer LLM
-      5. if DB is still insufficient, clearly-labelled model knowledge fallback
+      1. one-shot Planner/Scope Gate (one LLM call)
+         - scope decision
+         - 1~3 semantic Atomic Retrieval Units
+         - focused BM25 query + lexical keywords
+         - Tree path prior
+      2. unit-aware multi-view local BM25 retrieval
+         - focused Tree-local
+         - focused Global
+         - keyword Global
+         - original-query Tree/Global/FAQ rescue
+         - FAQ/provenance completion
+      3. per-unit RRF + cross-unit evidence coverage merge
+      4. Answer/Judge LLM
+      5. optional ONE evidence-guided hierarchical refinement + final Answer LLM
+      6. if DB is still insufficient, clearly-labelled model knowledge fallback
 
-    V4 intentionally has no progressive batch controller, repeated sufficiency
-    checker, sibling scheduler, or EvidenceSelector loop.
+    Tree routing is a relevance prior, never a hard evidence gate.
     """
 
     def __init__(
@@ -365,22 +374,261 @@ class TreeGuidedRAG:
             )
         return evidence
 
+    @staticmethod
+    def _tag_hits(hits, unit_id=None, query_view=None):
+        """Attach trace-only metadata without changing retrieval scores."""
+        tagged = []
+        for hit in hits or []:
+            item = dict(hit)
+            if unit_id:
+                item["unit_id"] = unit_id
+            if query_view:
+                item["query_view"] = query_view
+            tagged.append(item)
+        return tagged
+
+    def _retrieval_units(self, query, plan):
+        """Normalize Planner output; default conservatively to one unit."""
+        raw_units = list(plan.get("retrieval_units", []) or [])[:3]
+        units = []
+        seen_queries = set()
+
+        for i, raw in enumerate(raw_units, start=1):
+            unit_query = str(raw.get("query", "")).strip()
+            if not unit_query:
+                continue
+            key = unit_query.casefold()
+            if key in seen_queries:
+                continue
+            seen_queries.add(key)
+
+            keywords = []
+            seen_keywords = set()
+            for value in list(raw.get("keywords", []) or [])[:8]:
+                kw = str(value or "").strip()
+                if not kw:
+                    continue
+                kw_key = kw.casefold()
+                if kw_key in seen_keywords:
+                    continue
+                seen_keywords.add(kw_key)
+                keywords.append(kw)
+
+            units.append(
+                {
+                    "unit_id": f"U{len(units) + 1}",
+                    "query": unit_query,
+                    "keywords": keywords,
+                }
+            )
+
+        # Fail-safe: decomposition is optional. A normal single question must
+        # continue to work even if the Planner omits retrieval_units.
+        if not units:
+            fallback_query = str(plan.get("search_query", "")).strip() or query
+            units = [
+                {
+                    "unit_id": "U1",
+                    "query": fallback_query,
+                    "keywords": [],
+                }
+            ]
+
+        return units
+
+    def _retrieve_one_unit(self, unit, paths):
+        """Multi-view BM25 retrieval for one semantic retrieval unit."""
+        unit_id = unit["unit_id"]
+        focused_query = str(unit.get("query", "")).strip()
+        keyword_query = " ".join(unit.get("keywords", [])).strip()
+
+        # View A: semantic focused query inside routed Tree paths.
+        tree_hits = self._tag_hits(
+            self._tree_hits(
+                focused_query,
+                paths,
+                channel="tree",
+            ),
+            unit_id=unit_id,
+            query_view="focused_tree",
+        )
+
+        # View B: the same focused query globally, protecting recall when the
+        # correct atomic unit sits outside the routed Tree node.
+        global_hits = self._tag_hits(
+            self._global_hits(
+                focused_query,
+                top_k=self.config.unit_global_top_k,
+                channel="global_rewrite",
+            ),
+            unit_id=unit_id,
+            query_view="focused_global",
+        )
+
+        # View C: compact lexical anchors. This is deliberately Global because
+        # exact cataloging tokens may reveal evidence missed by taxonomy routing.
+        keyword_hits = []
+        if keyword_query and keyword_query.casefold() != focused_query.casefold():
+            keyword_hits = self._tag_hits(
+                self._global_hits(
+                    keyword_query,
+                    top_k=self.config.unit_keyword_top_k,
+                    channel="global_rewrite",
+                ),
+                unit_id=unit_id,
+                query_view="keywords",
+            )
+
+        # FAQ/source-family view still helps when one original FAQ was split into
+        # multiple atomic units.
+        faq_hits = self._tag_hits(
+            self._faq_hits(focused_query),
+            unit_id=unit_id,
+            query_view="focused_faq",
+        )
+
+        provenance_hits = self._tag_hits(
+            self._provenance_hits(
+                focused_query,
+                tree_hits,
+                global_hits,
+                keyword_hits,
+                faq_hits,
+            ),
+            unit_id=unit_id,
+            query_view="unit_provenance",
+        )
+
+        # Merge within the unit FIRST. This prevents an easy sub-question from
+        # flooding the final context and starving another unit of evidence.
+        evidence = self._merge_hits(
+            tree_hits,
+            global_hits,
+            keyword_hits,
+            faq_hits,
+            provenance_hits,
+            limit=self.config.unit_context_top_k,
+        )
+
+        return {
+            "unit_id": unit_id,
+            "query": focused_query,
+            "keywords": list(unit.get("keywords", [])),
+            "evidence": evidence,
+            "raw_hits": {
+                "tree": tree_hits,
+                "global": global_hits,
+                "keywords": keyword_hits,
+                "faq": faq_hits,
+                "provenance": provenance_hits,
+            },
+        }
+
+    def _combine_unit_evidence(self, unit_results, rescue_evidence, limit):
+        """Round-robin unit coverage, then fill spare slots with rescue hits."""
+        limit = max(1, int(limit))
+        selected = []
+        by_idx = {}
+
+        def add_item(raw_item, unit_id=None):
+            idx = int(raw_item["idx"])
+            if idx in by_idx:
+                existing = by_idx[idx]
+                if unit_id:
+                    units = existing.setdefault("retrieval_units", [])
+                    if unit_id not in units:
+                        units.append(unit_id)
+                for channel in raw_item.get("channels", []):
+                    channels = existing.setdefault("channels", [])
+                    if channel not in channels:
+                        channels.append(channel)
+                for path in raw_item.get("retrieved_paths", []):
+                    paths = existing.setdefault("retrieved_paths", [])
+                    if path not in paths:
+                        paths.append(path)
+                existing["retrieval_score"] = max(
+                    float(existing.get("retrieval_score", 0.0)),
+                    float(raw_item.get("retrieval_score", 0.0)),
+                )
+                existing["bm25"] = max(
+                    float(existing.get("bm25", 0.0)),
+                    float(raw_item.get("bm25", 0.0)),
+                )
+                return False
+
+            item = dict(raw_item)
+            item["retrieval_units"] = [unit_id] if unit_id else []
+            by_idx[idx] = item
+            selected.append(item)
+            return True
+
+        max_depth = max(
+            (len(result.get("evidence", [])) for result in unit_results),
+            default=0,
+        )
+
+        # U1-rank1, U2-rank1, ... then rank2, etc.
+        for depth in range(max_depth):
+            for result in unit_results:
+                evidence = result.get("evidence", [])
+                if depth >= len(evidence):
+                    continue
+                add_item(evidence[depth], unit_id=result["unit_id"])
+                if len(selected) >= limit:
+                    break
+            if len(selected) >= limit:
+                break
+
+        # Original-query rescue preserves robustness against a bad Planner rewrite
+        # or an unnecessary decomposition.
+        if len(selected) < limit:
+            for item in rescue_evidence or []:
+                add_item(item, unit_id=None)
+                if len(selected) >= limit:
+                    break
+
+        for rank, item in enumerate(selected, start=1):
+            item["rank"] = rank
+        return selected
+
     def _initial_retrieve(self, query, plan):
         paths = plan["paths"]
-        rewrite = str(plan.get("search_query", "")).strip() or query
-        combined_query = query if rewrite == query else f"{query}\n{rewrite}"
+        units = self._retrieval_units(query, plan)
 
-        # Global and FAQ retrieval do not depend on the remote planner. In run(),
-        # their original-query versions are launched concurrently with planning.
-        tree_hits = self._tree_hits(combined_query, paths)
+        # Preserve the literal user wording as a Tree view. This is useful for
+        # exact tokens such as 245, $n, LDR/19, #4, or a rare subject term.
+        original_tree_hits = self._tag_hits(
+            self._tree_hits(query, paths, channel="tree"),
+            unit_id=None,
+            query_view="original_tree",
+        )
+
+        # Backward-compatible overall Planner rewrite remains a global rescue view.
+        rewrite = str(plan.get("search_query", "")).strip()
         rewrite_global = []
-        if rewrite and rewrite.strip() != query.strip():
-            rewrite_global = self._global_hits(
-                rewrite,
-                top_k=self.config.global_rewrite_top_k,
-                channel="global_rewrite",
+        if rewrite and rewrite.casefold() != query.casefold():
+            rewrite_global = self._tag_hits(
+                self._global_hits(
+                    rewrite,
+                    top_k=self.config.global_rewrite_top_k,
+                    channel="global_rewrite",
+                ),
+                unit_id=None,
+                query_view="planner_rewrite",
             )
-        return tree_hits, rewrite_global
+
+        # All unit retrieval below is local BM25; parallelism adds no LLM calls.
+        unit_results = []
+        workers = max(1, min(3, len(units)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(self._retrieve_one_unit, unit, paths)
+                for unit in units
+            ]
+            for future in futures:
+                unit_results.append(future.result())
+
+        return units, unit_results, original_tree_hits, rewrite_global
 
     @staticmethod
     def _structural_constraints(text):
@@ -989,6 +1237,9 @@ class TreeGuidedRAG:
    - 其餘凡直接符合問題條件的項目都要納入；不得因為前兩三項語意較相似就停止。
    - grounded 的 evidence_ids 應包含實際支持答案各項目的 source atomic_id。
 5. evidence_ids 只能填上方實際存在的 atomic_id。
+   - 若 status=partial，evidence_ids 只能列「目前已能直接支持的部分」所使用的證據。
+   - 不要把僅僅相關、但仍不足以支持該部分結論的 evidence 放進 evidence_ids。
+   - 系統會在 refinement 時保留這些已接受 evidence，因此這個欄位代表「已支持、可安全 carry-forward」的證據，而不是一般相關文件清單。
 6. grounded 時不要加入模型既有知識。
 7. knowledge_fallback 時，答案中必須出現「【模型知識補充｜未由本次資料庫直接驗證】」。若 evidence 有可確認部分，可先列「資料庫可確認」再補充。
 8. partial 的 refinement_query 應使用原問題的精確 constraint + missing aspect；不得把你猜測的答案值塞進搜尋詞。
@@ -1055,6 +1306,93 @@ class TreeGuidedRAG:
         result["answer"] = answer
         return result
 
+    def _carry_forward_accepted_evidence(
+        self,
+        initial_decision,
+        first_round_evidence,
+        refined_evidence,
+        limit,
+    ):
+        """Preserve evidence explicitly accepted by the first-pass Judge.
+
+        Refinement is additive: it may discover new evidence for the missing
+        aspect, but it must not evict evidence that the first-pass Judge already
+        cited as directly supporting a resolved part of the question.
+
+        This is deliberately narrower than blanket first-round protection:
+        only ``initial_decision['evidence_ids']`` are protected.  All other
+        first-round hits continue to compete normally in RRF.
+        """
+        limit = max(1, int(limit))
+
+        accepted_ids = []
+        seen_ids = set()
+        for value in initial_decision.get("evidence_ids", []) or []:
+            atomic_id = str(value or "").strip()
+            if not atomic_id or atomic_id in seen_ids:
+                continue
+            seen_ids.add(atomic_id)
+            accepted_ids.append(atomic_id)
+
+        first_by_id = {
+            str(item.get("atomic_id", "")).strip(): item
+            for item in (first_round_evidence or [])
+            if str(item.get("atomic_id", "")).strip()
+        }
+        refined_by_id = {
+            str(item.get("atomic_id", "")).strip(): item
+            for item in (refined_evidence or [])
+            if str(item.get("atomic_id", "")).strip()
+        }
+
+        selected = []
+        selected_idx = set()
+        protected_ids = []
+
+        def append_item(raw, protected=False):
+            if not raw:
+                return False
+            idx = int(raw["idx"])
+            if idx in selected_idx:
+                return False
+            item = dict(raw)
+            if protected:
+                channels = list(item.get("channels", []))
+                if "protected_first_round" not in channels:
+                    channels.append("protected_first_round")
+                item["channels"] = channels
+
+                paths = list(item.get("retrieved_paths", []))
+                if "PROTECTED_FIRST_ROUND" not in paths:
+                    paths.append("PROTECTED_FIRST_ROUND")
+                item["retrieved_paths"] = paths
+
+            selected_idx.add(idx)
+            selected.append(item)
+            return True
+
+        # Accepted evidence is placed first so a later RRF merge cannot push it
+        # outside the final context budget. Prefer the richer refined copy when
+        # it is still present; otherwise recover the original first-round copy.
+        for atomic_id in accepted_ids:
+            raw = refined_by_id.get(atomic_id) or first_by_id.get(atomic_id)
+            if append_item(raw, protected=True):
+                protected_ids.append(atomic_id)
+            if len(selected) >= limit:
+                break
+
+        # Fill the remaining context slots with the normal refinement ranking.
+        if len(selected) < limit:
+            for item in refined_evidence or []:
+                append_item(item, protected=False)
+                if len(selected) >= limit:
+                    break
+
+        for rank, item in enumerate(selected, start=1):
+            item["rank"] = rank
+
+        return selected, protected_ids
+
     # ------------------------------------------------------------------
     # Gap logging for later DB curation
     # ------------------------------------------------------------------
@@ -1090,50 +1428,107 @@ class TreeGuidedRAG:
 
         t0 = time.perf_counter()
 
-        # Planner is remote; global and FAQ retrieval are local and independent.
+        # Planner is remote; original-query Global/FAQ are local and independent.
         with ThreadPoolExecutor(max_workers=3) as pool:
             plan_future = pool.submit(self.router.plan, query)
             global_future = pool.submit(self._global_hits, query)
             faq_future = pool.submit(self._faq_hits, query)
+
             plan = plan_future.result()
-            if not plan.get("in_scope", True):
-                return {
-                    "answer": "您的問題跟編目問題無關。",
-                    "mode": "out_of_scope",
-                    "knowledge_used": False,
-                    "planner": plan,
-                    "retrieval": {
-                        "evidence_count": 0,
-                        "evidence": [],
-                    },
-                }
             global_hits = global_future.result()
             faq_hits = faq_future.result()
+
+        t_plan_parallel = time.perf_counter()
+
+        # --------------------------------------------------------------
+        # Scope Gate: in-domain-but-unanswerable is NOT out_of_scope.
+        # This check must happen after `plan` exists and before answer/retrieval
+        # logic that assumes a normal cataloging question.
+        # --------------------------------------------------------------
+        if not plan.get("in_scope", True):
+            scope_decision = {
+                "status": "out_of_scope",
+                "answer": OUT_OF_SCOPE_MESSAGE,
+                "missing": "",
+                "refinement_query": "",
+                "evidence_ids": [],
+                "knowledge_used": False,
+            }
+            elapsed = round(time.perf_counter() - t0, 4)
+            return {
+                "answer": OUT_OF_SCOPE_MESSAGE,
+                "mode": "out_of_scope",
+                "knowledge_used": False,
+                "initial_decision": scope_decision,
+                "final_decision": scope_decision,
+                "answer_scope": "out_of_scope",
+                "refinement_used": False,
+                "refinement": None,
+                "planner": {
+                    "in_scope": False,
+                    "query_focus": "",
+                    "search_query": "",
+                    "retrieval_units": [],
+                    "fallback": bool(plan.get("fallback", False)),
+                },
+                "unit_retrieval": [],
+                "paths": [],
+                "source_retrieval": {
+                    "source_count": 0,
+                    "sources": [],
+                },
+                "retrieval": {
+                    "evidence_count": 0,
+                    "evidence": [],
+                },
+                "timing": {
+                    "planner_plus_parallel_local_retrieval": round(
+                        t_plan_parallel - t0, 4
+                    ),
+                    "tree_merge_retrieval": 0.0,
+                    "first_answer_judge": 0.0,
+                    "refinement_and_final_answer": 0.0,
+                    "total": elapsed,
+                },
+            }
 
         # Completeness intent is local and orthogonal to Tree routing.
         answer_scope = self._answer_scope(query)
 
-        t_plan_parallel = time.perf_counter()
+        (
+            retrieval_units,
+            unit_results,
+            original_tree_hits,
+            rewrite_global,
+        ) = self._initial_retrieve(query, plan)
 
-        tree_hits, rewrite_global = self._initial_retrieve(query, plan)
-        # Provenance completion follows the lexical rescue channels. Global
-        # hits are direct query matches across the whole DB; using them as FAQ
-        # anchors avoids a broad Tree node flooding provenance with unrelated
-        # siblings while still repairing atomic fragmentation.
-        provenance_hits = self._provenance_hits(
+        # Original-query rescue is deliberately independent of decomposition.
+        # If the Planner over-splits or rewrites poorly, literal user wording still
+        # has a full Tree + Global + FAQ + provenance path into final context.
+        original_provenance = self._provenance_hits(
             query,
             global_hits,
             rewrite_global,
-            tree_hits,
+            original_tree_hits,
+            faq_hits,
         )
-        evidence = self._merge_hits(
-            tree_hits,
+        rescue_evidence = self._merge_hits(
+            original_tree_hits,
             global_hits,
             rewrite_global,
             faq_hits,
-            provenance_hits,
+            original_provenance,
             limit=self.config.context_limit,
         )
+
+        # Ensure each semantic unit gets evidence quota before original-query
+        # rescue fills remaining slots.
+        evidence = self._combine_unit_evidence(
+            unit_results,
+            rescue_evidence,
+            limit=self.config.context_limit,
+        )
+
         source_evidence = self._source_evidence_for_set_query(
             query,
             evidence,
@@ -1154,10 +1549,8 @@ class TreeGuidedRAG:
         refinement_trace = None
         final_paths = list(plan["paths"])
 
-        if (
-            self.config.enable_refinement
-            and initial.get("status") == "partial"
-        ):
+        # Keep the existing ONE evidence-guided refinement round unchanged.
+        if self.config.enable_refinement and initial.get("status") == "partial":
             refinement_used = True
             refinement_query = str(initial.get("refinement_query", "")).strip()
             if not refinement_query:
@@ -1184,9 +1577,8 @@ class TreeGuidedRAG:
                 refine_faq,
                 refine_tree,
             )
+            first_round_evidence = list(evidence)
             refined_evidence = self._merge_hits(
-                # Keep first-round evidence in the candidate pool by recreating a
-                # lightweight provenance channel from their indices.
                 [
                     {
                         "idx": x["idx"],
@@ -1197,7 +1589,7 @@ class TreeGuidedRAG:
                         "route_score": 0.0,
                         "path": "FIRST_ROUND",
                     }
-                    for i, x in enumerate(evidence, start=1)
+                    for i, x in enumerate(first_round_evidence, start=1)
                 ],
                 refine_tree,
                 refine_global,
@@ -1205,7 +1597,32 @@ class TreeGuidedRAG:
                 refine_provenance,
                 limit=self.config.refinement_context_limit,
             )
-            evidence = refined_evidence
+
+            # V4.3.1: refinement is additive.  Preserve only evidence that the
+            # first-pass Judge explicitly cited as already supported; do NOT
+            # blanket-protect all first-round hits.
+            pre_protection_ids = [
+                str(x.get("atomic_id", "")).strip()
+                for x in refined_evidence
+                if str(x.get("atomic_id", "")).strip()
+            ]
+            evidence, protected_ids = self._carry_forward_accepted_evidence(
+                initial,
+                first_round_evidence,
+                refined_evidence,
+                limit=self.config.refinement_context_limit,
+            )
+            if refinement_trace is not None:
+                refinement_trace["accepted_first_pass_evidence_ids"] = list(
+                    initial.get("evidence_ids", []) or []
+                )
+                refinement_trace["pre_protection_evidence_ids"] = pre_protection_ids
+                refinement_trace["protected_evidence_ids"] = protected_ids
+                refinement_trace["final_evidence_ids"] = [
+                    str(x.get("atomic_id", "")).strip()
+                    for x in evidence
+                    if str(x.get("atomic_id", "")).strip()
+                ]
             source_evidence = self._source_evidence_for_set_query(
                 query,
                 evidence,
@@ -1220,8 +1637,6 @@ class TreeGuidedRAG:
 
         t_final = time.perf_counter()
 
-        # Initial non-grounded status is itself a useful DB-gap signal, even if
-        # refinement later succeeds from a different slice of the same database.
         if initial.get("status") != "grounded" or final.get("knowledge_used"):
             self._log_gap(
                 query,
@@ -1233,7 +1648,9 @@ class TreeGuidedRAG:
             )
 
         timing = {
-            "planner_plus_parallel_local_retrieval": round(t_plan_parallel - t0, 4),
+            "planner_plus_parallel_local_retrieval": round(
+                t_plan_parallel - t0, 4
+            ),
             "tree_merge_retrieval": round(t_retrieval - t_plan_parallel, 4),
             "first_answer_judge": round(t_first_answer - t_retrieval, 4),
             "refinement_and_final_answer": round(t_final - t_first_answer, 4),
@@ -1250,10 +1667,36 @@ class TreeGuidedRAG:
             "refinement_used": refinement_used,
             "refinement": refinement_trace,
             "planner": {
+                "in_scope": bool(plan.get("in_scope", True)),
                 "query_focus": plan.get("query_focus", ""),
                 "search_query": plan.get("search_query", query),
+                "retrieval_units": plan.get("retrieval_units", []),
                 "fallback": bool(plan.get("fallback", False)),
             },
+            "unit_retrieval": [
+                {
+                    "unit_id": result["unit_id"],
+                    "query": result["query"],
+                    "keywords": result["keywords"],
+                    "evidence_ids": [
+                        x.get("atomic_id", "")
+                        for x in result.get("evidence", [])
+                    ],
+                    "evidence": [
+                        {
+                            "rank": x.get("rank", 0),
+                            "atomic_id": x.get("atomic_id", ""),
+                            "faq_id": x.get("faq_id", ""),
+                            "question": x.get("question", ""),
+                            "answer": x.get("answer", ""),
+                            "channels": x.get("channels", []),
+                            "retrieval_score": x.get("retrieval_score", 0.0),
+                        }
+                        for x in result.get("evidence", [])
+                    ],
+                }
+                for result in unit_results
+            ],
             "paths": [
                 {
                     "path": p.display(),
@@ -1293,6 +1736,7 @@ class TreeGuidedRAG:
                         "answer": x.get("answer", ""),
                         "channels": x.get("channels", []),
                         "retrieved_paths": x.get("retrieved_paths", []),
+                        "retrieval_units": x.get("retrieval_units", []),
                         "retrieval_score": x.get("retrieval_score", 0.0),
                     }
                     for x in evidence
@@ -1300,3 +1744,4 @@ class TreeGuidedRAG:
             },
             "timing": timing,
         }
+
