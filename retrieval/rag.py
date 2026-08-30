@@ -1096,6 +1096,17 @@ class TreeGuidedRAG:
             global_future = pool.submit(self._global_hits, query)
             faq_future = pool.submit(self._faq_hits, query)
             plan = plan_future.result()
+            if not plan.get("in_scope", True):
+                return {
+                    "answer": "您的問題跟編目問題無關。",
+                    "mode": "out_of_scope",
+                    "knowledge_used": False,
+                    "planner": plan,
+                    "retrieval": {
+                        "evidence_count": 0,
+                        "evidence": [],
+                    },
+                }
             global_hits = global_future.result()
             faq_hits = faq_future.result()
 
