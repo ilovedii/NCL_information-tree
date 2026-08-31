@@ -32,7 +32,7 @@ class TreeGuidedRAG:
          - FAQ/provenance completion
       3. per-unit RRF + cross-unit evidence coverage merge
       4. Answer/Judge LLM
-      5. optional ONE evidence-guided hierarchical refinement + final Answer LLM
+      5. optional ONE unit-aware evidence-guided refinement + final Answer LLM
       6. if DB is still insufficient, clearly-labelled model knowledge fallback
 
     Tree routing is a relevance prior, never a hard evidence gate.
@@ -338,6 +338,7 @@ class TreeGuidedRAG:
                         "max_bm25": float("-inf"),
                         "channels": [],
                         "paths": [],
+                        "retrieval_units": [],
                     },
                 )
                 entry["rrf_score"] += self._channel_contribution(hit)
@@ -350,6 +351,22 @@ class TreeGuidedRAG:
                 path = str(hit.get("path", ""))
                 if path and path not in entry["paths"]:
                     entry["paths"].append(path)
+
+                # Preserve unit provenance through RRF.  Initial retrieval already
+                # keeps units separate; refinement must not erase that identity
+                # before the Answer/Judge sees the evidence.
+                unit_values = []
+                unit_id = str(hit.get("unit_id", "")).strip()
+                if unit_id:
+                    unit_values.append(unit_id)
+                unit_values.extend(
+                    str(x).strip()
+                    for x in (hit.get("retrieval_units", []) or [])
+                    if str(x).strip()
+                )
+                for value in unit_values:
+                    if value not in entry["retrieval_units"]:
+                        entry["retrieval_units"].append(value)
 
         ranked = sorted(
             merged.values(),
@@ -370,9 +387,50 @@ class TreeGuidedRAG:
                     "bm25": float(item["max_bm25"]),
                     "channels": item["channels"],
                     "retrieved_paths": item["paths"],
+                    "retrieval_units": item.get("retrieval_units", []),
                 }
             )
         return evidence
+
+    def _rerank_refinement_by_missing(self, evidence, missing):
+        """Rerank one refinement unit using only Judge missing relevance.
+
+        RRF remains responsible for candidate generation/recall. Once refinement
+        starts, the ranking objective changes: evidence should be ordered only by
+        how directly it matches the unresolved `missing` description. No RRF,
+        channel count, FAQ-family preference, or other unit contributes to this
+        second-stage score. Ties keep the original unit-local order only as a
+        deterministic fallback.
+        """
+        items = [dict(x) for x in (evidence or [])]
+        if not items:
+            return items
+
+        target = str(missing or "").strip()
+        if not target:
+            return items
+
+        texts = [
+            f"問題：{str(item.get('question', '')).strip()}\n"
+            f"答案：{str(item.get('answer', '')).strip()}"
+            for item in items
+        ]
+        scores = BM25(texts).scores(target)
+
+        decorated = []
+        for original_pos, (item, score) in enumerate(zip(items, scores)):
+            item["pre_missing_rerank_rank"] = int(item.get("rank", original_pos + 1))
+            item["missing_relevance_score"] = float(score)
+            decorated.append((float(score), original_pos, item))
+
+        # Missing relevance is the ONLY refinement ranking score. Original order
+        # is used only to make exact-score ties deterministic; it is not blended
+        # into the relevance score.
+        decorated.sort(key=lambda row: (-row[0], row[1]))
+        reranked = [row[2] for row in decorated]
+        for rank, item in enumerate(reranked, start=1):
+            item["rank"] = rank
+        return reranked
 
     @staticmethod
     def _tag_hits(hits, unit_id=None, query_view=None):
@@ -649,10 +707,11 @@ class TreeGuidedRAG:
 
         # Explicit MARC tag references.
         tag_patterns = [
-            r"(?i)\btag\s*0*(\d{3})\b",
-            r"(?i)\bmarc(?:\s*21)?\s*(?:欄位|field)?\s*0*(\d{3})\b",
-            r"欄位\s*0*(\d{3})\b",
-            r"(\d{3})\s*段\b",
+            r"(?i)\btag\s*0*(\d{3})(?!\d)",
+            r"(?i)\bmarc(?:\s*21)?\s*(?:欄位|field)?\s*0*(\d{3})(?!\d)",
+            r"欄位\s*0*(\d{3})(?!\d)",
+            r"0*(\d{3})\s*(?:欄位|field)",
+            r"(\d{3})\s*段",
         ]
         for pattern in tag_patterns:
             for m in re.finditer(pattern, text):
@@ -701,56 +760,63 @@ class TreeGuidedRAG:
 
     def _build_refinement_search_query(
         self,
-        original_query,
+        unit_query,
         refinement_query,
         missing,
-        first_round_evidence,
+        unit_first_round_evidence,
     ):
-        """Build one evidence-guided second-pass query.
+        """Build one unit-local evidence-guided second-pass query.
 
-        This is local pseudo-relevance feedback, not another LLM call.
-        The missing aspect remains the main target, while terminology from the
-        most relevant first-round evidence helps bridge vocabulary mismatch
-        (e.g. user wording vs. older cataloguing terminology).
+        PRF is deliberately scoped to the retrieval unit being refined. Evidence
+        from other units never participates in feedback selection.  The Judge's
+        ``missing`` description is the main relevance target; the unit query is
+        retained for structural constraints (MARC tag, subfield, indicator, etc.).
+        Low-quality feedback is optional rather than forced to fill Top-K.
         """
         base_parts = [
-            str(original_query or "").strip(),
+            str(unit_query or "").strip(),
             str(refinement_query or "").strip(),
             str(missing or "").strip(),
         ]
         base_query = "\n".join(x for x in base_parts if x)
 
-        evidence = list(first_round_evidence or [])
-        if not evidence:
-            return base_query, []
-
-        feedback_texts = [
-            self._compact_feedback_text(
+        evidence = list(unit_first_round_evidence or [])
+        feedback_items = []
+        for item in evidence:
+            feedback_text = self._compact_feedback_text(
                 item,
                 answer_chars=self.config.refinement_feedback_answer_chars,
             )
-            for item in evidence
-        ]
-        feedback_texts = [x for x in feedback_texts if x]
-        if not feedback_texts:
-            return base_query, []
+            if feedback_text:
+                feedback_items.append((item, feedback_text))
 
+        if not feedback_items:
+            return base_query, [], []
+
+        # Missing-aspect relevance decides whether a first-round item is useful
+        # feedback.  The full unit context is used only for exact structural
+        # constraints so an unrelated MARC field cannot drift the query.
         target_text = (
-            f"{original_query}\n{refinement_query}\n{missing}".strip()
+            f"{refinement_query}\n{missing}".strip()
+            or str(unit_query or "").strip()
         )
-        scores = BM25(feedback_texts).scores(
-            f"{refinement_query}\n{missing}".strip() or original_query
+        constraint_target = (
+            f"{unit_query}\n{refinement_query}\n{missing}".strip()
         )
+        feedback_texts = [text for _, text in feedback_items]
+        scores = BM25(feedback_texts).scores(target_text)
         overlaps = [
-            self._constraint_overlap(target_text, text)
+            self._constraint_overlap(constraint_target, text)
             for text in feedback_texts
         ]
-        has_constraints = bool(self._structural_constraints(target_text))
+        has_constraints = bool(self._structural_constraints(constraint_target))
 
-        candidate_indices = list(range(len(feedback_texts)))
-        if has_constraints and any(overlaps):
-            # When the query specifies an exact field/position/subfield,
-            # use only evidence aligned to at least one of those constraints.
+        candidate_indices = list(range(len(feedback_items)))
+        if has_constraints:
+            # Exact MARC/Leader/subfield/indicator constraints are hard PRF
+            # guards. If none of the accepted feedback evidence shares the
+            # structural constraint, use no PRF rather than letting generic
+            # lexical overlap drift the refinement into another field.
             candidate_indices = [i for i in candidate_indices if overlaps[i] > 0]
 
         order = sorted(
@@ -759,24 +825,136 @@ class TreeGuidedRAG:
             reverse=True,
         )
 
+        # Do not force refinement_feedback_top_k items into PRF.  Without a
+        # structural match, require a positive BM25 score and at least 35% of
+        # the best candidate's score.  This is a conservative drift guard.
+        best_score = max((float(scores[i]) for i in candidate_indices), default=0.0)
+        relative_ratio = float(
+            getattr(self.config, "refinement_feedback_relative_floor", 0.35)
+        )
+        relative_ratio = max(0.0, min(1.0, relative_ratio))
+        relative_floor = best_score * relative_ratio if best_score > 0 else 0.0
+
         selected = []
         selected_ids = []
+        selected_index_set = set()
         limit = max(0, int(self.config.refinement_feedback_top_k))
-        for i in order[:limit]:
+        for i in order:
+            if len(selected) >= limit:
+                break
+            score = float(scores[i])
+            overlap = int(overlaps[i])
+            if overlap <= 0:
+                if score <= 0 or score < relative_floor:
+                    continue
             selected.append(feedback_texts[i])
-            evidence_id = str(evidence[i].get("atomic_id", "")).strip()
+            selected_index_set.add(i)
+            evidence_id = str(feedback_items[i][0].get("atomic_id", "")).strip()
             if evidence_id:
                 selected_ids.append(evidence_id)
 
+        feedback_trace = []
+        for i, (item, _) in enumerate(feedback_items):
+            feedback_trace.append(
+                {
+                    "atomic_id": str(item.get("atomic_id", "")).strip(),
+                    "bm25_score": float(scores[i]),
+                    "constraint_overlap": int(overlaps[i]),
+                    "selected": i in selected_index_set,
+                }
+            )
+
         if not selected:
-            return base_query, []
+            return base_query, [], feedback_trace
 
         expanded = (
             f"{base_query}\n"
-            "第一輪相關 evidence 用語：\n"
+            "此 unit 第一輪高可信 evidence 用語：\n"
             + "\n".join(selected)
         ).strip()
-        return expanded, selected_ids
+        return expanded, selected_ids, feedback_trace
+
+    @staticmethod
+    def _unique_strings(values):
+        result = []
+        seen = set()
+        for value in values or []:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _select_refinement_unit_results(
+        self,
+        unit_results,
+        requested_unit_ids,
+        refinement_query,
+        missing,
+    ):
+        """Choose only the units that need the second retrieval round.
+
+        The first-pass Judge is the primary selector.  A deterministic BM25
+        fallback is used only when the Judge omits/returns invalid unit IDs.
+        """
+        unit_results = list(unit_results or [])
+        by_id = {str(x.get("unit_id", "")): x for x in unit_results}
+        requested = [
+            unit_id
+            for unit_id in self._unique_strings(requested_unit_ids)
+            if unit_id in by_id
+        ]
+        if requested:
+            selected = [by_id[unit_id] for unit_id in requested[:3]]
+            return selected, {
+                "selection_source": "judge",
+                "requested_unit_ids": requested,
+                "selected_unit_ids": [x["unit_id"] for x in selected],
+                "fallback_scores": [],
+            }
+
+        if not unit_results:
+            return [], {
+                "selection_source": "none",
+                "requested_unit_ids": [],
+                "selected_unit_ids": [],
+                "fallback_scores": [],
+            }
+        if len(unit_results) == 1:
+            return [unit_results[0]], {
+                "selection_source": "single_unit_fallback",
+                "requested_unit_ids": [],
+                "selected_unit_ids": [unit_results[0]["unit_id"]],
+                "fallback_scores": [],
+            }
+
+        target = f"{refinement_query}\n{missing}".strip()
+        unit_texts = [
+            f"{x.get('query', '')}\n{' '.join(x.get('keywords', []))}".strip()
+            for x in unit_results
+        ]
+        scores = BM25(unit_texts).scores(target) if target else [0.0] * len(unit_texts)
+        ranked = sorted(
+            range(len(unit_results)),
+            key=lambda i: float(scores[i]),
+            reverse=True,
+        )
+        best = ranked[0]
+        selected = [unit_results[best]]
+        score_trace = [
+            {
+                "unit_id": unit_results[i]["unit_id"],
+                "score": float(scores[i]),
+            }
+            for i in ranked
+        ]
+        return selected, {
+            "selection_source": "bm25_fallback",
+            "requested_unit_ids": [],
+            "selected_unit_ids": [unit_results[best]["unit_id"]],
+            "fallback_scores": score_trace,
+        }
 
     def _same_parent_sibling_scope(self, base_paths):
         """Build local sibling-L3 search scopes under routed L2 parents.
@@ -901,17 +1079,20 @@ class TreeGuidedRAG:
 
     def _refinement_retrieve(
         self,
-        original_query,
+        unit_id,
+        unit_query,
         refinement_query,
         missing,
         base_paths,
-        first_round_evidence,
+        unit_first_round_evidence,
     ):
-        search_query, feedback_ids = self._build_refinement_search_query(
-            original_query,
-            refinement_query,
-            missing,
-            first_round_evidence,
+        search_query, feedback_ids, feedback_trace = (
+            self._build_refinement_search_query(
+                unit_query,
+                refinement_query,
+                missing,
+                unit_first_round_evidence,
+            )
         )
 
         sibling_scopes, sibling_paths = self._same_parent_sibling_scope(
@@ -925,25 +1106,107 @@ class TreeGuidedRAG:
             path_map.setdefault(path.key(), path)
         paths = list(path_map.values())
 
-        # First-round evidence already preserves the originally routed nodes.
-        # The refinement round therefore spends its local Tree budget only on
-        # the missing local neighborhood: sibling L3 documents under the same
-        # routed L2 parent. Global/FAQ rescue remains available in parallel.
-        tree_hits = self._sibling_scope_hits(
-            search_query,
-            sibling_scopes,
+        # Every refinement channel is scoped to the selected unit.  The same
+        # retrieval algorithm is used for every unit; only its own query/evidence
+        # are visible, preventing cross-unit PRF/provenance contamination.
+        tree_hits = self._tag_hits(
+            self._sibling_scope_hits(search_query, sibling_scopes),
+            unit_id=unit_id,
+            query_view="unit_refinement_tree",
         )
-        global_hits = self._global_hits(
-            search_query,
-            top_k=self.config.global_top_k,
-            channel="refine_global",
+        global_hits = self._tag_hits(
+            self._global_hits(
+                search_query,
+                top_k=self.config.global_top_k,
+                channel="refine_global",
+            ),
+            unit_id=unit_id,
+            query_view="unit_refinement_global",
         )
-        faq_hits = self._faq_hits(search_query)
+        faq_hits = self._tag_hits(
+            self._faq_hits(search_query),
+            unit_id=unit_id,
+            query_view="unit_refinement_faq",
+        )
+
+        # Critical continuity rule: the selected unit's own first-round evidence
+        # is the first provenance anchor group.  If a unit already reached the
+        # correct source family, the second round can inspect sibling atomics
+        # without depending on a noisy new search to rediscover that family.
+        provenance_query = (
+            f"{unit_query}\n{refinement_query}\n{missing}".strip()
+        )
+        provenance_hits = self._tag_hits(
+            self._provenance_hits(
+                provenance_query,
+                unit_first_round_evidence,
+                global_hits,
+                faq_hits,
+                tree_hits,
+            ),
+            unit_id=unit_id,
+            query_view="unit_refinement_provenance",
+        )
+
+        # Unit-local second-pass ranking. Every first-round evidence item from
+        # THIS unit remains a candidate, and all new Tree/Global/FAQ/Provenance
+        # hits are merged and ranked only against one another inside this unit.
+        # No other retrieval unit participates in this ranking, and no single
+        # feedback hit or FAQ family is privileged merely for being rank #1.
+        unit_first_round_hits = []
+        for rank, item in enumerate(unit_first_round_evidence or [], start=1):
+            unit_first_round_hits.append(
+                {
+                    "idx": int(item["idx"]),
+                    "bm25": item.get("bm25", 0.0),
+                    "channel": "first_round",
+                    "channel_rank": rank,
+                    "route_rank": None,
+                    "route_score": 0.0,
+                    "path": "UNIT_FIRST_ROUND",
+                    "unit_id": unit_id,
+                    "retrieval_units": [unit_id],
+                }
+            )
+
+        unit_refined_evidence = self._merge_hits(
+            unit_first_round_hits,
+            tree_hits,
+            global_hits,
+            faq_hits,
+            provenance_hits,
+            limit=None,
+        )
+
+        # Keep the multi-channel RRF order for refinement. A pure lexical
+        # rerank against `missing` over-rewards wording overlap and can promote
+        # documents that repeat decision words while answering a different
+        # cataloging rule. The missing aspect still drives the second-pass query,
+        # but it is not used as a single-score replacement for RRF.
 
         meta = {
+            "unit_id": unit_id,
+            "unit_query": str(unit_query or "").strip(),
             "requested_query": str(refinement_query or "").strip(),
             "expanded_query": search_query,
             "feedback_evidence_ids": feedback_ids,
+            "feedback_candidates": feedback_trace,
+            "provenance_anchor_evidence_ids": [
+                str(x.get("atomic_id", "")).strip()
+                for x in (unit_first_round_evidence or [])
+                if str(x.get("atomic_id", "")).strip()
+            ],
+            "provenance_evidence_ids": [
+                str(self.taxonomy.document_record(int(x["idx"])).get("atomic_id", "")).strip()
+                for x in provenance_hits
+            ],
+            "refinement_ranking_mode": "rrf_multichannel",
+            "unit_refined_evidence_ids": [
+                str(x.get("atomic_id", "")).strip()
+                for x in unit_refined_evidence
+                if str(x.get("atomic_id", "")).strip()
+            ],
+            "missing_rerank_scores": [],
             "sibling_paths": [p.display() for p in sibling_paths],
             "sibling_parent_scopes": [
                 {
@@ -954,7 +1217,15 @@ class TreeGuidedRAG:
                 for scope in sibling_scopes
             ],
         }
-        return paths, tree_hits, global_hits, faq_hits, meta
+        return (
+            paths,
+            tree_hits,
+            global_hits,
+            faq_hits,
+            provenance_hits,
+            unit_refined_evidence,
+            meta,
+        )
 
     # ------------------------------------------------------------------
     # Answer / judge
@@ -1098,8 +1369,9 @@ class TreeGuidedRAG:
         for item in evidence:
             source_id = str(item.get("atomic_id", "")).strip()
             channels = ",".join(item.get("channels", []))
+            unit_tags = ",".join(item.get("retrieval_units", []) or []) or "unscoped"
             blocks.append(
-                f"[{source_id}] retrieval_channels={channels}\n"
+                f"[{source_id}] retrieval_units={unit_tags}; retrieval_channels={channels}\n"
                 f"日期：{item.get('question_date', '')}\n"
                 f"問題：{item.get('question', '')}\n"
                 f"答案：{item.get('answer', '')}\n"
@@ -1107,7 +1379,7 @@ class TreeGuidedRAG:
             )
         return "\n\n".join(blocks)
 
-    def _answer_schema(self, allowed_ids, allow_partial):
+    def _answer_schema(self, allowed_ids, allow_partial, unit_ids=None):
         # V4.0.2:
         # First pass is retrieval diagnosis only. It may either answer from DB
         # evidence (grounded) or request exactly one refinement (partial).
@@ -1118,6 +1390,12 @@ class TreeGuidedRAG:
             if allow_partial
             else ["grounded", "knowledge_fallback"]
         )
+        unit_ids = self._unique_strings(unit_ids)
+        unit_item_schema = (
+            {"type": "string", "enum": unit_ids}
+            if unit_ids
+            else {"type": "string"}
+        )
         return {
             "type": "object",
             "properties": {
@@ -1125,6 +1403,10 @@ class TreeGuidedRAG:
                 "answer": {"type": "string"},
                 "missing": {"type": "string"},
                 "refinement_query": {"type": "string"},
+                "refinement_unit_ids": {
+                    "type": "array",
+                    "items": unit_item_schema,
+                },
                 "evidence_ids": {
                     "type": "array",
                     "items": {"type": "string", "enum": allowed_ids},
@@ -1136,12 +1418,20 @@ class TreeGuidedRAG:
                 "answer",
                 "missing",
                 "refinement_query",
+                "refinement_unit_ids",
                 "evidence_ids",
                 "knowledge_used",
             ],
         }
 
-    def _answer_once(self, query, evidence, source_evidence=None, allow_partial=True):
+    def _answer_once(
+        self,
+        query,
+        evidence,
+        source_evidence=None,
+        allow_partial=True,
+        retrieval_units=None,
+    ):
         ids = [
             str(x.get("atomic_id", "")).strip()
             for x in evidence
@@ -1195,7 +1485,19 @@ class TreeGuidedRAG:
             context_parts.append(label + atomic_context)
 
         context = "\n\n".join(context_parts)
-        schema = self._answer_schema(ids, allow_partial=allow_partial)
+        retrieval_units = list(retrieval_units or [])
+        unit_ids = [str(x.get("unit_id", "")).strip() for x in retrieval_units]
+        unit_lines = [
+            f"[{x.get('unit_id', '')}] {x.get('query', '')}"
+            for x in retrieval_units
+            if str(x.get("unit_id", "")).strip()
+        ]
+        unit_context = "\n".join(unit_lines) or "(單一未標記 retrieval unit)"
+        schema = self._answer_schema(
+            ids,
+            allow_partial=allow_partial,
+            unit_ids=unit_ids,
+        )
 
         if allow_partial:
             status_instructions = """請選擇 status：
@@ -1221,6 +1523,9 @@ class TreeGuidedRAG:
 使用者問題：
 {query}
 
+本題 retrieval units：
+{unit_context}
+
 本次資料庫檢索 evidence：
 {context if context else '(沒有檢索到 evidence)'}
 
@@ -1242,8 +1547,16 @@ class TreeGuidedRAG:
    - 系統會在 refinement 時保留這些已接受 evidence，因此這個欄位代表「已支持、可安全 carry-forward」的證據，而不是一般相關文件清單。
 6. grounded 時不要加入模型既有知識。
 7. knowledge_fallback 時，答案中必須出現「【模型知識補充｜未由本次資料庫直接驗證】」。若 evidence 有可確認部分，可先列「資料庫可確認」再補充。
-8. partial 的 refinement_query 應使用原問題的精確 constraint + missing aspect；不得把你猜測的答案值塞進搜尋詞。
-9. 回答使用繁體中文，直接回答館員問題，不輸出內部 reasoning。
+8. 逐一判斷每個 retrieval unit 是否已被 evidence 覆蓋。evidence 行首的 retrieval_units 表示該證據由哪些 unit 的檢索取得；這是 coverage 判斷的重要線索，但不是硬性限制，同一正式證據可安全支援多個 unit。
+9. 允許「多筆 evidence 的安全組合」：例如一筆說明特定 indicator/條件的意義，另一筆說明該欄位的一般使用規則；只要兩者沒有衝突，且組合後沒有新增 evidence 未寫出的條件，就可以共同支持答案。不要要求所有結論都必須逐字出現在同一個 atomic unit。
+10. grounded 必須同時滿足「規則充分」與「個案資訊充分」。若使用者要求對特定個案直接定案、選唯一做法、判斷確切欄位或確切值，但目前 evidence 只有一般規則，而實際結論仍依賴使用者未提供的實物呈現、來源位置、版本、館藏政策、系統設定或其他個案事實，則不得把一般規則直接套成唯一個案結論；第一輪應回 partial 並指出缺少哪個必要事實。
+11. 即使進入 knowledge_fallback，也只能補充一般知識，不能虛構使用者未提供的個案事實。若欠缺的是只有檢視實物、來源畫面、館內政策或系統設定才能知道的資訊，應明確說明仍無法定案，而不是自行假設後作答。
+12. partial 的 refinement_query 只應描述仍未回答完整的 unit 及其 missing aspect；不要把已經有充分 evidence 的 unit 再混入 query，也不得把你猜測的答案值塞進搜尋詞。
+13. refinement_unit_ids：
+   - status=partial 時，只列仍缺 evidence、需要第二輪檢索的 unit_id。
+   - 已有充分 evidence 的 unit 不得列入，即使整題仍為 partial。
+   - status=grounded 或 knowledge_fallback 時填空陣列。
+14. 回答使用繁體中文，直接回答館員問題，不輸出內部 reasoning。
 
 {final_instruction}
 """
@@ -1285,6 +1598,14 @@ class TreeGuidedRAG:
             for x in result.get("evidence_ids", [])
             if str(x).strip() in allowed
         ]
+        allowed_unit_ids = set(unit_ids)
+        result["refinement_unit_ids"] = [
+            x
+            for x in self._unique_strings(result.get("refinement_unit_ids", []))
+            if x in allowed_unit_ids
+        ]
+        if status != "partial":
+            result["refinement_unit_ids"] = []
         result["status"] = status
         result["knowledge_used"] = status == "knowledge_fallback" or knowledge_used
 
@@ -1541,6 +1862,7 @@ class TreeGuidedRAG:
             evidence,
             source_evidence=source_evidence,
             allow_partial=self.config.enable_refinement,
+            retrieval_units=retrieval_units,
         )
         t_first_answer = time.perf_counter()
 
@@ -1549,58 +1871,108 @@ class TreeGuidedRAG:
         refinement_trace = None
         final_paths = list(plan["paths"])
 
-        # Keep the existing ONE evidence-guided refinement round unchanged.
+        # V4.3.2-U: one second-pass round, but at retrieval-unit granularity.
+        # Resolved units are preserved; only units identified as missing are
+        # re-searched, each with its own first-round evidence pool.
         if self.config.enable_refinement and initial.get("status") == "partial":
             refinement_used = True
+            missing = str(initial.get("missing", "")).strip()
             refinement_query = str(initial.get("refinement_query", "")).strip()
             if not refinement_query:
-                missing = str(initial.get("missing", "")).strip()
-                refinement_query = f"{query} {missing}".strip()
+                refinement_query = missing or query
 
-            (
-                final_paths,
-                refine_tree,
-                refine_global,
-                refine_faq,
-                refinement_trace,
-            ) = self._refinement_retrieve(
-                query,
-                refinement_query,
-                str(initial.get("missing", "")).strip(),
-                plan["paths"],
-                evidence,
+            selected_unit_results, unit_selection = (
+                self._select_refinement_unit_results(
+                    unit_results,
+                    initial.get("refinement_unit_ids", []),
+                    refinement_query,
+                    missing,
+                )
             )
 
-            refine_provenance = self._provenance_hits(
-                refinement_query,
-                refine_global,
-                refine_faq,
-                refine_tree,
-            )
+            path_map = {p.key(): p for p in plan["paths"]}
+            unit_refinement_traces = []
+            refined_by_unit_id = {}
+
+            accepted_first_pass_ids = {
+                str(x).strip()
+                for x in (initial.get("evidence_ids", []) or [])
+                if str(x).strip()
+            }
+
+            for unit_result in selected_unit_results:
+                full_unit_first_round = list(unit_result.get("evidence", []) or [])
+                accepted_unit_first_round = [
+                    item
+                    for item in full_unit_first_round
+                    if str(item.get("atomic_id", "")).strip()
+                    in accepted_first_pass_ids
+                ]
+
+                (
+                    unit_paths,
+                    refine_tree,
+                    refine_global,
+                    refine_faq,
+                    refine_provenance,
+                    unit_refined_evidence,
+                    unit_meta,
+                ) = self._refinement_retrieve(
+                    unit_result["unit_id"],
+                    unit_result["query"],
+                    refinement_query,
+                    missing,
+                    plan["paths"],
+                    accepted_unit_first_round,
+                )
+                unit_meta["first_round_evidence_ids_before_acceptance_gate"] = [
+                    str(x.get("atomic_id", "")).strip()
+                    for x in full_unit_first_round
+                    if str(x.get("atomic_id", "")).strip()
+                ]
+                unit_meta["accepted_first_round_seed_ids"] = [
+                    str(x.get("atomic_id", "")).strip()
+                    for x in accepted_unit_first_round
+                    if str(x.get("atomic_id", "")).strip()
+                ]
+                unit_meta["refinement_seed_policy"] = "judge_accepted_only"
+                for path in unit_paths:
+                    path_map.setdefault(path.key(), path)
+                refined_by_unit_id[unit_result["unit_id"]] = unit_refined_evidence
+                unit_refinement_traces.append(unit_meta)
+
+            final_paths = list(path_map.values())
             first_round_evidence = list(evidence)
-            refined_evidence = self._merge_hits(
-                [
+
+            # Keep units independent through refinement. Resolved units retain
+            # their first-round evidence; only the selected unit(s) are replaced
+            # by their own deeper local ranking. Cross-unit competition starts
+            # only after those independent rankings are complete.
+            final_unit_results = []
+            for unit_result in unit_results:
+                unit_id = unit_result["unit_id"]
+                local_evidence = refined_by_unit_id.get(
+                    unit_id,
+                    unit_result.get("evidence", []),
+                )
+                final_unit_results.append(
                     {
-                        "idx": x["idx"],
-                        "bm25": x.get("bm25", 0.0),
-                        "channel": "first_round",
-                        "channel_rank": i,
-                        "route_rank": None,
-                        "route_score": 0.0,
-                        "path": "FIRST_ROUND",
+                        "unit_id": unit_id,
+                        "query": unit_result.get("query", ""),
+                        "keywords": list(unit_result.get("keywords", []) or []),
+                        "evidence": local_evidence,
                     }
-                    for i, x in enumerate(first_round_evidence, start=1)
-                ],
-                refine_tree,
-                refine_global,
-                refine_faq,
-                refine_provenance,
+                )
+
+            refined_evidence = self._combine_unit_evidence(
+                final_unit_results,
+                rescue_evidence,
                 limit=self.config.refinement_context_limit,
             )
 
-            # V4.3.1: refinement is additive.  Preserve only evidence that the
-            # first-pass Judge explicitly cited as already supported; do NOT
-            # blanket-protect all first-round hits.
+            # V4.3.1 carry-forward remains unchanged: evidence explicitly accepted
+            # by the first Judge is protected while new evidence fills the missing
+            # unit.
             pre_protection_ids = [
                 str(x.get("atomic_id", "")).strip()
                 for x in refined_evidence
@@ -1612,17 +1984,37 @@ class TreeGuidedRAG:
                 refined_evidence,
                 limit=self.config.refinement_context_limit,
             )
-            if refinement_trace is not None:
-                refinement_trace["accepted_first_pass_evidence_ids"] = list(
+
+            refinement_trace = {
+                "requested_query": refinement_query,
+                "missing": missing,
+                **unit_selection,
+                "units": unit_refinement_traces,
+                "feedback_evidence_ids": self._unique_strings(
+                    evidence_id
+                    for meta in unit_refinement_traces
+                    for evidence_id in meta.get("feedback_evidence_ids", [])
+                ),
+                "accepted_first_pass_evidence_ids": list(
                     initial.get("evidence_ids", []) or []
-                )
-                refinement_trace["pre_protection_evidence_ids"] = pre_protection_ids
-                refinement_trace["protected_evidence_ids"] = protected_ids
-                refinement_trace["final_evidence_ids"] = [
+                ),
+                "pre_protection_evidence_ids": pre_protection_ids,
+                "protected_evidence_ids": protected_ids,
+                "final_unit_evidence_ids": {
+                    result["unit_id"]: [
+                        str(x.get("atomic_id", "")).strip()
+                        for x in result.get("evidence", [])
+                        if str(x.get("atomic_id", "")).strip()
+                    ]
+                    for result in final_unit_results
+                },
+                "final_evidence_ids": [
                     str(x.get("atomic_id", "")).strip()
                     for x in evidence
                     if str(x.get("atomic_id", "")).strip()
-                ]
+                ],
+            }
+
             source_evidence = self._source_evidence_for_set_query(
                 query,
                 evidence,
@@ -1633,6 +2025,7 @@ class TreeGuidedRAG:
                 evidence,
                 source_evidence=source_evidence,
                 allow_partial=False,
+                retrieval_units=retrieval_units,
             )
 
         t_final = time.perf_counter()
