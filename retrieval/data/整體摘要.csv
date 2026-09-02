@@ -1,0 +1,5 @@
+﻿系統,good數,good率,weighted
+Naive,190,38.0%,57.3%
+Enhanced,327,65.4%,82.1%
+GraphRAG,352,70.4%,84.1%
+Wiki,482,96.4%,98.1%

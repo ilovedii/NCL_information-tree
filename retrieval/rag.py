@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+from answer_embedding_retriever import AnswerEmbeddingRetriever
 from llm_client import OllamaClient, OpenAICompatibleClient
 from retriever import BM25, HybridRetriever
 from router import RoutePath, TreeRouter
@@ -83,6 +84,19 @@ class TreeGuidedRAG:
             use_embedding=config.use_embedding,
             batch_size=config.embedding_batch_size,
         )
+
+        # V2-A: independent global answer-only E5 rescue.
+        #
+        # Keep config.use_embedding=False so the legacy HybridRetriever remains
+        # BM25-only.  This separate retriever loads the precomputed
+        # answer_embeddings.npy built with multilingual-e5-large.
+        self.answer_embedding_retriever = None
+        if getattr(self.config, "use_answer_embedding", False):
+            self.answer_embedding_retriever = AnswerEmbeddingRetriever(
+                embedding_path=self.config.answer_embedding_path,
+                expected_rows=len(self.taxonomy.df),
+                model_name=self.config.answer_embedding_model,
+            )
 
         self._all_indices = list(range(len(self.taxonomy.df)))
         (
@@ -200,6 +214,94 @@ class TreeGuidedRAG:
             }
             for rank, hit in enumerate(hits, start=1)
         ]
+
+    def _answer_embedding_hits(self, query):
+        """Global answer-only semantic rescue; no Tree restriction and no rerank."""
+        if self.answer_embedding_retriever is None:
+            return []
+        return self.answer_embedding_retriever.search(
+            query,
+            top_k=self.config.answer_embedding_top_k,
+        )
+
+    def _append_answer_embedding_evidence(self, evidence, embedding_hits):
+        """Append only unique answer-embedding hits after the original BM25 context.
+
+        Design for V2-A:
+        - preserve the original BM25/RRF-selected evidence and its order exactly;
+        - do not feed embedding hits into _merge_hits / RRF;
+        - deduplicate exact atomic units;
+        - append semantic rescue hits in embedding rank order;
+        - do not impose a second context cutoff here.
+
+        Therefore the maximum first-round context is:
+            original context_limit + answer_embedding_top_k
+        before duplicate removal.
+        """
+        selected = [dict(item) for item in (evidence or [])]
+
+        seen_atomic_ids = {
+            str(item.get("atomic_id", "")).strip()
+            for item in selected
+            if str(item.get("atomic_id", "")).strip()
+        }
+        seen_indices = {
+            int(item["idx"])
+            for item in selected
+            if item.get("idx") is not None
+        }
+
+        candidate_ids = []
+        added_ids = []
+        duplicate_ids = []
+
+        for hit in embedding_hits or []:
+            idx = int(hit["idx"])
+            record = self.taxonomy.document_record(idx)
+            atomic_id = str(record.get("atomic_id", "")).strip()
+            candidate_ids.append(atomic_id or f"ROW:{idx}")
+
+            is_duplicate = (
+                (atomic_id and atomic_id in seen_atomic_ids)
+                or idx in seen_indices
+            )
+            if is_duplicate:
+                duplicate_ids.append(atomic_id or f"ROW:{idx}")
+                continue
+
+            selected.append(
+                {
+                    **record,
+                    "idx": idx,
+                    "rank": len(selected) + 1,
+                    "retrieval_score": float(hit.get("dense", 0.0)),
+                    "bm25": 0.0,
+                    "dense": float(hit.get("dense", 0.0)),
+                    "channels": ["answer_embedding"],
+                    "retrieved_paths": ["GLOBAL_ANSWER_EMBEDDING"],
+                    "retrieval_units": [],
+                }
+            )
+
+            seen_indices.add(idx)
+            if atomic_id:
+                seen_atomic_ids.add(atomic_id)
+            added_ids.append(atomic_id or f"ROW:{idx}")
+
+        # Keep the pre-existing order.  Only refresh display ranks.
+        for rank, item in enumerate(selected, start=1):
+            item["rank"] = rank
+
+        trace = {
+            "enabled": self.answer_embedding_retriever is not None,
+            "top_k": int(getattr(self.config, "answer_embedding_top_k", 0)),
+            "candidate_ids": candidate_ids,
+            "added_ids": added_ids,
+            "duplicate_ids": duplicate_ids,
+            "original_evidence_count": len(evidence or []),
+            "final_evidence_count": len(selected),
+        }
+        return selected, trace
 
     def _faq_hits(self, query):
         if self._faq_bm25 is None or not self._faq_ids:
@@ -1388,7 +1490,7 @@ class TreeGuidedRAG:
         statuses = (
             ["grounded", "partial"]
             if allow_partial
-            else ["grounded", "knowledge_fallback"]
+            else ["grounded", "partial", "knowledge_fallback"]
         )
         unit_ids = self._unique_strings(unit_ids)
         unit_item_schema = (
@@ -1412,6 +1514,22 @@ class TreeGuidedRAG:
                     "items": {"type": "string", "enum": allowed_ids},
                 },
                 "knowledge_used": {"type": "boolean"},
+                "question_requirement": {
+                    "type": "string",
+                    "enum": [
+                        "general_rule",
+                        "case_specific",
+                        "exact_fact",
+                        "current_latest",
+                        "mixed",
+                    ],
+                },
+                "evidence_directly_answers": {"type": "boolean"},
+                "required_precision_supported": {"type": "boolean"},
+                "unsupported_answer_aspects": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
             },
             "required": [
                 "status",
@@ -1421,6 +1539,10 @@ class TreeGuidedRAG:
                 "refinement_unit_ids",
                 "evidence_ids",
                 "knowledge_used",
+                "question_requirement",
+                "evidence_directly_answers",
+                "required_precision_supported",
+                "unsupported_answer_aspects",
             ],
         }
 
@@ -1431,6 +1553,7 @@ class TreeGuidedRAG:
         source_evidence=None,
         allow_partial=True,
         retrieval_units=None,
+        prior_decision=None,
     ):
         ids = [
             str(x.get("atomic_id", "")).strip()
@@ -1493,6 +1616,47 @@ class TreeGuidedRAG:
             if str(x.get("unit_id", "")).strip()
         ]
         unit_context = "\n".join(unit_lines) or "(單一未標記 retrieval unit)"
+
+        prior_sufficiency_context = ""
+        if prior_decision:
+            prior_requirement = str(
+                prior_decision.get("question_requirement", "")
+            ).strip()
+            prior_direct = bool(
+                prior_decision.get("evidence_directly_answers", False)
+            )
+            prior_precision = bool(
+                prior_decision.get("required_precision_supported", False)
+            )
+            prior_unsupported = self._unique_strings(
+                prior_decision.get("unsupported_answer_aspects", []) or []
+            )
+
+            prior_lines = [
+                "=== 第一輪尚未解決的充分性條件（refinement 後必須重新驗證）===",
+                f"第一輪 question_requirement: {prior_requirement or '(未標記)'}",
+                f"第一輪 evidence_directly_answers: {prior_direct}",
+                f"第一輪 required_precision_supported: {prior_precision}",
+                "第一輪 unsupported_answer_aspects:",
+            ]
+            if prior_unsupported:
+                prior_lines.extend(f"- {x}" for x in prior_unsupported)
+            else:
+                prior_lines.append("- (無)")
+
+            prior_lines.extend(
+                [
+                    "",
+                    "最終判斷規則：",
+                    "1. 若第一輪曾有 unsupported_answer_aspects，refinement 後必須逐項確認是否被本輪 evidence『直接解決』。",
+                    "2. 只有當 evidence 明確提供能解決該缺口的新資訊時，才可把 required_precision_supported 改成 true。",
+                    "3. 只是再次看到第一輪相同的 evidence、相近案例、舊版資料或一般背景，不算解決原缺口。",
+                    "4. 若缺口涉及 current/latest/version，必須有 evidence 明確支持目前/最新版狀態，或明確證明舊版規則截至所問時點仍有效；僅有舊版的確切答案不足。",
+                    "5. 若任何第一輪 unsupported aspect 仍未被直接解決，最終不得把整題判成完整 grounded；答案應保留已由資料庫確認的部分，並清楚說明仍無法確定的部分。",
+                ]
+            )
+            prior_sufficiency_context = "\n".join(prior_lines)
+
         schema = self._answer_schema(
             ids,
             allow_partial=allow_partial,
@@ -1511,11 +1675,14 @@ class TreeGuidedRAG:
             )
         else:
             status_instructions = """請選擇 status：
-- grounded：核心答案可由目前 evidence 直接支持或安全組合支持。knowledge_used=false。
-- knowledge_fallback：已完成一次 refinement 後，資料庫仍不足以完整回答；此時才可使用模型知識回答，knowledge_used=true，而且必須清楚標示哪些內容未由本次資料庫直接驗證。"""
+- grounded：核心答案的每一個必要部分，都已由目前 evidence 直接支持或安全組合支持。knowledge_used=false。
+- partial：refinement 後仍有某些使用者要求的精確面向未被 evidence 直接支持，但資料庫已能確認部分內容。knowledge_used=false。此時不要硬猜；答案必須先說「資料庫可確認的內容」，再清楚說「現有材料仍無法確認的部分」。
+- knowledge_fallback：refinement 後資料庫仍不足，而你確實需要使用模型既有知識補充一般知識時才使用。knowledge_used=true，且必須清楚標示未由本次資料庫直接驗證的部分。"""
             final_instruction = (
-                "這是 refinement 後的最終判斷。若資料庫仍不完整，不可再回 partial；"
-                "才可使用 knowledge_fallback，並把資料庫可確認內容與模型知識補充分開。"
+                "這是 refinement 後的最終判斷。"
+                "若 evidence 只能支持部分答案，請使用 partial，"
+                "先保留已確認的資料庫事實，再明確說明仍無法定案的面向；"
+                "不要為了給出完整答案而把舊版、相近案例或未驗證的精確值當成已確認。"
             )
 
         prompt = f"""你是國家圖書館 Tree-RAG 的 Answer/Judge。
@@ -1526,10 +1693,49 @@ class TreeGuidedRAG:
 本題 retrieval units：
 {unit_context}
 
+{prior_sufficiency_context if prior_sufficiency_context else ""}
+
 本次資料庫檢索 evidence：
 {context if context else '(沒有檢索到 evidence)'}
 
 {status_instructions}
+
+在決定 status 與作答前，先完成以下「需求－證據充分性檢查」。這不是要輸出長篇推理，只需把結論填入 JSON 欄位：
+
+A. question_requirement
+先判斷使用者真正要求的答案層級：
+- general_rule：一般規則、定義、概念、清單、欄位意義等。
+- case_specific：要求對某一特定資料、實物、紀錄或館務情境作判斷。
+- exact_fact：要求確切類號、代碼、indicator、subfield、年份、數值、欄位內容或其他精確值。
+- current_latest：要求「現行、目前、最新版、最新修訂、截至現在」等具有版本或時效性的結論。
+- mixed：同時包含上述兩種以上要求。
+
+B. evidence_directly_answers
+判斷目前 evidence 是否直接回答了使用者真正問的事項。
+- true：evidence 明確支持核心結論。
+- false：evidence 只有相近案例、一般背景、部分欄位、部分子問題，或只能間接推論。
+注意：『語意相關』不等於『直接支持答案』。
+
+C. required_precision_supported
+判斷 evidence 是否支持到使用者要求的精確程度。
+- 若使用者問 exact code / exact field / exact class number，evidence 必須直接支持該確切值。
+- 若使用者問 current/latest，evidence 必須能證明其版本或時點足以代表目前/最新版；舊版資料不能自動推成現行版本仍相同。
+- 若問題包含多個子項，每個會影響核心答案的子項都必須有支持，不能因多數子項已找到就把整題視為充分。
+- 若特定個案的唯一結論仍依賴使用者未提供的實物、語言、版本、內容比重、來源位置、館藏政策、系統設定等事實，應視為不足。
+
+D. unsupported_answer_aspects
+如果 evidence_directly_answers=false 或 required_precision_supported=false，列出「目前 evidence 還不能支持」的具體答案面向。
+例如：
+- 「255 $d 的確切定義」
+- 「008/33 雙月刊的確切代碼」
+- 「現行最新版是否仍沿用 624.13」
+不要只寫「資料不足」；要指出缺的是哪個答案面向。
+
+完成 A～D 後，再決定 status：
+- grounded：只有 evidence_directly_answers=true 且 required_precision_supported=true，且核心答案各部分均可由 evidence 直接或安全組合支持時才可選。
+- partial：第一輪若仍有 unsupported_answer_aspects，應優先回 partial 並針對缺口 refinement。
+- knowledge_fallback：只在 refinement 後仍缺「一般資料庫知識」時使用；不得把未被 evidence 支持的 exact code、exact number、current/latest 狀態或使用者未提供的個案事實，僅憑模型記憶說成已確定。
+
 
 規則：
 1. evidence 中的正式規則、數字、碼數、位址、indicator、subfield、年份、順序與條件不得被改寫成不同內容。
@@ -1549,14 +1755,34 @@ class TreeGuidedRAG:
 7. knowledge_fallback 時，答案中必須出現「【模型知識補充｜未由本次資料庫直接驗證】」。若 evidence 有可確認部分，可先列「資料庫可確認」再補充。
 8. 逐一判斷每個 retrieval unit 是否已被 evidence 覆蓋。evidence 行首的 retrieval_units 表示該證據由哪些 unit 的檢索取得；這是 coverage 判斷的重要線索，但不是硬性限制，同一正式證據可安全支援多個 unit。
 9. 允許「多筆 evidence 的安全組合」：例如一筆說明特定 indicator/條件的意義，另一筆說明該欄位的一般使用規則；只要兩者沒有衝突，且組合後沒有新增 evidence 未寫出的條件，就可以共同支持答案。不要要求所有結論都必須逐字出現在同一個 atomic unit。
-10. grounded 必須同時滿足「規則充分」與「個案資訊充分」。若使用者要求對特定個案直接定案、選唯一做法、判斷確切欄位或確切值，但目前 evidence 只有一般規則，而實際結論仍依賴使用者未提供的實物呈現、來源位置、版本、館藏政策、系統設定或其他個案事實，則不得把一般規則直接套成唯一個案結論；第一輪應回 partial 並指出缺少哪個必要事實。
-11. 即使進入 knowledge_fallback，也只能補充一般知識，不能虛構使用者未提供的個案事實。若欠缺的是只有檢視實物、來源畫面、館內政策或系統設定才能知道的資訊，應明確說明仍無法定案，而不是自行假設後作答。
-12. partial 的 refinement_query 只應描述仍未回答完整的 unit 及其 missing aspect；不要把已經有充分 evidence 的 unit 再混入 query，也不得把你猜測的答案值塞進搜尋詞。
-13. refinement_unit_ids：
+10. 不得把「相關 evidence」誤當成「足以支持使用者要求精度的 evidence」。
+   - 若 question_requirement=exact_fact，沒有直接支持確切值時，不得只靠相近欄位、相近案例或常識補成確切答案。
+   - 若 question_requirement=current_latest，舊版、舊答覆或未標示時點的 evidence 不能自動證明現行最新版仍相同。
+   - 若問題有多個子項，只要核心子項仍在 unsupported_answer_aspects 中，就不能把整題視為完整 grounded。
+   - 若是 case_specific，其他案例的定案不能替代目前個案缺少的必要事實。
+11. refinement 是「補第一輪缺口」，不是重新忘記第一輪限制後從頭猜答案。
+   - 若第一輪 required_precision_supported=false，第二輪必須先檢查原 unsupported_answer_aspects 是否真的被新 evidence 解決。
+   - 未被解決時，不得僅因原答案再次出現在 evidence 中，就把 required_precision_supported 改成 true。
+   - 對 current/latest/version 類問題尤其如此：2007 年版的正確答案只能證明 2007 年版，不能單獨證明現行最新版。
+
+12. 若最終 status=partial，答案採「已確認事實 + 未確認限制」的形式：
+   - 先直接回答目前 evidence 已經能確定的部分，不要只說「資料不足」。
+   - 再指出使用者原問題中哪一個面向仍未被現有材料支持。
+   - 例如，若 evidence 只證明 2007 年版《武則天傳》為 624.13，而題目問「現行最新版」，應回答：
+     「依目前資料可確認，《中文圖書分類法》2007 年版中《武則天傳》為 624.13；但現有材料未提供足以確認現行最新版是否仍沿用此號的證據，因此不能把 624.13 直接當成現行最新版的定案。」
+   - 這種回答不是 knowledge_fallback，因為沒有使用模型知識補造缺口。
+
+13. knowledge_fallback 只能補一般知識，不能把下列內容說成已由本次資料庫確定：
+   - evidence 未支持的 exact code / exact number / exact field value；
+   - 未被 evidence 證明的 current/latest/version 狀態；
+   - 使用者未提供、且只能由實物或館內情境確認的個案事實。
+   對這些內容應明確標示仍無法由本次資料確定，而不是自行補成唯一答案。
+14. partial 的 refinement_query 只應描述仍未回答完整的 unit 及其 missing aspect；不要把已經有充分 evidence 的 unit 再混入 query，也不得把你猜測的答案值塞進搜尋詞。
+15. refinement_unit_ids：
    - status=partial 時，只列仍缺 evidence、需要第二輪檢索的 unit_id。
    - 已有充分 evidence 的 unit 不得列入，即使整題仍為 partial。
    - status=grounded 或 knowledge_fallback 時填空陣列。
-14. 回答使用繁體中文，直接回答館員問題，不輸出內部 reasoning。
+16. 回答使用繁體中文，直接回答館員問題，不輸出內部 reasoning。
 
 {final_instruction}
 """
@@ -1572,6 +1798,44 @@ class TreeGuidedRAG:
         status = str(result.get("status", "")).strip()
         knowledge_used = bool(result.get("knowledge_used", False))
 
+        # --------------------------------------------------------------
+        # General sufficiency diagnostics (observation only)
+        # --------------------------------------------------------------
+        # These fields are normalized for trace analysis only.
+        # Python does NOT override status or answer based on them.
+        allowed_requirements = {
+            "general_rule",
+            "case_specific",
+            "exact_fact",
+            "current_latest",
+            "mixed",
+        }
+        question_requirement = str(
+            result.get("question_requirement", "")
+        ).strip()
+        if question_requirement not in allowed_requirements:
+            question_requirement = "general_rule"
+
+        evidence_directly_answers = bool(
+            result.get("evidence_directly_answers", False)
+        )
+        required_precision_supported = bool(
+            result.get("required_precision_supported", False)
+        )
+        unsupported_answer_aspects = self._unique_strings(
+            result.get("unsupported_answer_aspects", []) or []
+        )
+
+        # Keep the diagnostic fields internally consistent for analysis,
+        # without changing the model's status/answer.
+        if evidence_directly_answers and required_precision_supported:
+            unsupported_answer_aspects = []
+
+        result["question_requirement"] = question_requirement
+        result["evidence_directly_answers"] = evidence_directly_answers
+        result["required_precision_supported"] = required_precision_supported
+        result["unsupported_answer_aspects"] = unsupported_answer_aspects
+
         # Deterministic lifecycle guard:
         #   pass 1  -> grounded | partial
         #   pass 2  -> grounded | knowledge_fallback
@@ -1585,7 +1849,11 @@ class TreeGuidedRAG:
                 # discarded; it must not become user-facing before DB refinement.
                 result["answer"] = ""
         else:
-            if status != "grounded":
+            if status == "partial":
+                # Final partial is a legitimate "supported fact + unresolved limit"
+                # outcome.  It does not imply model-knowledge use.
+                knowledge_used = False
+            elif status != "grounded":
                 status = "knowledge_fallback"
                 knowledge_used = True
             elif knowledge_used:
@@ -1604,20 +1872,31 @@ class TreeGuidedRAG:
             for x in self._unique_strings(result.get("refinement_unit_ids", []))
             if x in allowed_unit_ids
         ]
-        if status != "partial":
+        if status != "partial" or not allow_partial:
             result["refinement_unit_ids"] = []
         result["status"] = status
         result["knowledge_used"] = status == "knowledge_fallback" or knowledge_used
 
-        if allow_partial and status == "partial":
+        if status == "partial":
             missing = str(result.get("missing", "")).strip()
-            refinement_query = str(result.get("refinement_query", "")).strip()
             if not missing:
-                missing = "目前資料庫 evidence 尚不足以直接支持完整答案"
-            if not refinement_query:
-                refinement_query = f"{query} {missing}".strip()
+                unsupported = self._unique_strings(
+                    result.get("unsupported_answer_aspects", []) or []
+                )
+                if unsupported:
+                    missing = "目前仍無法由 evidence 確認：" + "、".join(unsupported)
+                else:
+                    missing = "目前資料庫 evidence 尚不足以直接支持完整答案"
             result["missing"] = missing
-            result["refinement_query"] = refinement_query
+
+            if allow_partial:
+                refinement_query = str(result.get("refinement_query", "")).strip()
+                if not refinement_query:
+                    refinement_query = f"{query} {missing}".strip()
+                result["refinement_query"] = refinement_query
+            else:
+                # Final partial: there is no third retrieval round.
+                result["refinement_query"] = ""
 
         answer = str(result.get("answer", "")).strip()
         if result["status"] == "knowledge_fallback" and self.config.allow_model_knowledge_fallback:
@@ -1728,6 +2007,30 @@ class TreeGuidedRAG:
             "final_status": final.get("status"),
             "initial_missing": initial.get("missing", ""),
             "refinement_query": initial.get("refinement_query", ""),
+            "initial_question_requirement": initial.get(
+                "question_requirement", "general_rule"
+            ),
+            "initial_evidence_directly_answers": bool(
+                initial.get("evidence_directly_answers", False)
+            ),
+            "initial_required_precision_supported": bool(
+                initial.get("required_precision_supported", False)
+            ),
+            "initial_unsupported_answer_aspects": list(
+                initial.get("unsupported_answer_aspects", []) or []
+            ),
+            "final_question_requirement": final.get(
+                "question_requirement", "general_rule"
+            ),
+            "final_evidence_directly_answers": bool(
+                final.get("evidence_directly_answers", False)
+            ),
+            "final_required_precision_supported": bool(
+                final.get("required_precision_supported", False)
+            ),
+            "final_unsupported_answer_aspects": list(
+                final.get("unsupported_answer_aspects", []) or []
+            ),
             "refinement_used": bool(refinement_used),
             "knowledge_used": bool(final.get("knowledge_used", False)),
             "routed_paths": [p.display() for p in paths],
@@ -1749,15 +2052,21 @@ class TreeGuidedRAG:
 
         t0 = time.perf_counter()
 
-        # Planner is remote; original-query Global/FAQ are local and independent.
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        # Planner is remote; original-query Global/FAQ and answer embedding
+        # retrieval are local and independent.
+        with ThreadPoolExecutor(max_workers=4) as pool:
             plan_future = pool.submit(self.router.plan, query)
             global_future = pool.submit(self._global_hits, query)
             faq_future = pool.submit(self._faq_hits, query)
+            answer_embedding_future = pool.submit(
+                self._answer_embedding_hits,
+                query,
+            )
 
             plan = plan_future.result()
             global_hits = global_future.result()
             faq_hits = faq_future.result()
+            answer_embedding_hits = answer_embedding_future.result()
 
         t_plan_parallel = time.perf_counter()
 
@@ -1774,6 +2083,10 @@ class TreeGuidedRAG:
                 "refinement_query": "",
                 "evidence_ids": [],
                 "knowledge_used": False,
+                "question_requirement": "general_rule",
+                "evidence_directly_answers": False,
+                "required_precision_supported": False,
+                "unsupported_answer_aspects": [],
             }
             elapsed = round(time.perf_counter() - t0, 4)
             return {
@@ -1848,6 +2161,17 @@ class TreeGuidedRAG:
             unit_results,
             rescue_evidence,
             limit=self.config.context_limit,
+        )
+
+        # V2-A causal experiment:
+        # preserve the complete original BM25-selected context, then append
+        # unique global answer-embedding Top-K hits.  No RRF/reranker is applied
+        # to the embedding lane.
+        evidence, answer_embedding_trace = (
+            self._append_answer_embedding_evidence(
+                evidence,
+                answer_embedding_hits,
+            )
         )
 
         source_evidence = self._source_evidence_for_set_query(
@@ -2026,6 +2350,7 @@ class TreeGuidedRAG:
                 source_evidence=source_evidence,
                 allow_partial=False,
                 retrieval_units=retrieval_units,
+                prior_decision=initial,
             )
 
         t_final = time.perf_counter()
@@ -2066,6 +2391,7 @@ class TreeGuidedRAG:
                 "retrieval_units": plan.get("retrieval_units", []),
                 "fallback": bool(plan.get("fallback", False)),
             },
+            "answer_embedding": answer_embedding_trace,
             "unit_retrieval": [
                 {
                     "unit_id": result["unit_id"],
