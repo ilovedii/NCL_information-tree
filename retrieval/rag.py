@@ -875,12 +875,19 @@ class TreeGuidedRAG:
         retained for structural constraints (MARC tag, subfield, indicator, etc.).
         Low-quality feedback is optional rather than forced to fill Top-K.
         """
-        base_parts = [
-            str(unit_query or "").strip(),
+        # V2-C4: make the second-pass search truly missing-unit focused.
+        # The full unit query is intentionally NOT mixed back into the lexical
+        # search when the Judge already supplied a precise refinement target;
+        # otherwise solved parts of a multi-part question can dominate BM25.
+        # Structural constraints from the original unit (MARC tag/subfield/etc.)
+        # are still retained below in ``constraint_target`` as drift guards.
+        focused_parts = [
             str(refinement_query or "").strip(),
             str(missing or "").strip(),
         ]
-        base_query = "\n".join(x for x in base_parts if x)
+        base_query = "\n".join(x for x in focused_parts if x)
+        if not base_query:
+            base_query = str(unit_query or "").strip()
 
         evidence = list(unit_first_round_evidence or [])
         feedback_items = []
@@ -987,6 +994,42 @@ class TreeGuidedRAG:
             seen.add(text)
             result.append(text)
         return result
+
+    @staticmethod
+    def _sanitize_user_visible_answer(answer):
+        """Remove internal provenance labels from user-visible prose only.
+
+        The structured ``evidence_ids`` field and trace are intentionally left
+        untouched.  This is a presentation-layer guard for librarian-facing
+        output, not a retrieval or grounding change.
+        """
+        text = str(answer or "").strip()
+        if not text:
+            return text
+
+        # Remove bracketed atomic-id citations such as:
+        #   [23481_A01]
+        #   [23481_A01, 31000_A01, 31000_A02]
+        text = re.sub(
+            r"\[\s*[A-Za-z0-9]+_A\d+(?:\s*[,;|]\s*[A-Za-z0-9]+_A\d+)*\s*\]",
+            "",
+            text,
+        )
+
+        # Remove legacy display references such as [Ref 1] or [Ref 1][Ref 2].
+        text = re.sub(r"\[\s*Ref(?:erence)?\s*\d+\s*\]", "", text, flags=re.I)
+
+        # Defensive cleanup in case the model emits a bare internal atomic id
+        # despite the presentation instruction.
+        text = re.sub(r"\b\d{4,}_A\d+\b", "", text)
+
+        # Normalize whitespace introduced by citation removal without changing
+        # deliberate paragraph breaks or cataloging punctuation.
+        text = re.sub(r"[ \t]+(?=\n)", "", text)
+        text = re.sub(r" {2,}", " ", text)
+        text = re.sub(r"\s+([，。；：、！？,.!?;:])", r"\1", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     def _select_refinement_unit_results(
         self,
@@ -1648,11 +1691,12 @@ class TreeGuidedRAG:
                 [
                     "",
                     "最終判斷規則：",
-                    "1. 若第一輪曾有 unsupported_answer_aspects，refinement 後必須逐項確認是否被本輪 evidence『直接解決』。",
-                    "2. 只有當 evidence 明確提供能解決該缺口的新資訊時，才可把 required_precision_supported 改成 true。",
-                    "3. 只是再次看到第一輪相同的 evidence、相近案例、舊版資料或一般背景，不算解決原缺口。",
-                    "4. 若缺口涉及 current/latest/version，必須有 evidence 明確支持目前/最新版狀態，或明確證明舊版規則截至所問時點仍有效；僅有舊版的確切答案不足。",
-                    "5. 若任何第一輪 unsupported aspect 仍未被直接解決，最終不得把整題判成完整 grounded；答案應保留已由資料庫確認的部分，並清楚說明仍無法確定的部分。",
+                    "1. 先重新檢查每個第一輪 unsupported_answer_aspect 是否真的是使用者原問題要求的必要面向；若是 Judge 第一輪自行增加的『通用準則、完整流程、明確優先順序、額外比較規則或完全相同案例』，而使用者並未要求，應移除該缺口，不得因它未被補到而維持 partial。",
+                    "2. 對真正必要的缺口，refinement 後確認是否已被新 evidence『直接支持或安全組合支持』；一般規則題不要求存在逐字相同案例。",
+                    "3. 若新 evidence 與既有 evidence 可以在不新增規則、條件、數值、例外或個案事實的前提下安全組合，視為已解決；若仍需模型自行創造新規則，才算未解決。",
+                    "4. exact code / exact number / exact field value 仍必須有 evidence 支持確切值；不得用相近欄位、相近案例或常識補成確切答案。",
+                    "5. 若缺口涉及 current/latest/version，必須有 evidence 明確支持目前/最新版狀態，或明確證明舊版規則截至所問時點仍有效；僅有舊版的確切答案不足。",
+                    "6. 若真正必要的 unsupported aspect 仍未解決，最終不得把整題判成完整 grounded；但若剩下的只是一般知識缺口、且不涉及 exact/current/case-specific 個案事實，可使用 knowledge_fallback 明確標示補充，而不是整題完全不回答。",
                 ]
             )
             prior_sufficiency_context = "\n".join(prior_lines)
@@ -1677,7 +1721,7 @@ class TreeGuidedRAG:
             status_instructions = """請選擇 status：
 - grounded：核心答案的每一個必要部分，都已由目前 evidence 直接支持或安全組合支持。knowledge_used=false。
 - partial：refinement 後仍有某些使用者要求的精確面向未被 evidence 直接支持，但資料庫已能確認部分內容。knowledge_used=false。此時不要硬猜；答案必須先說「資料庫可確認的內容」，再清楚說「現有材料仍無法確認的部分」。
-- knowledge_fallback：refinement 後資料庫仍不足，而你確實需要使用模型既有知識補充一般知識時才使用。knowledge_used=true，且必須清楚標示未由本次資料庫直接驗證的部分。"""
+- knowledge_fallback：refinement 後仍缺的是「一般規則／一般背景知識」，而不是未驗證的 exact code、exact number、current/latest/version 狀態或使用者未提供的個案事實時，應優先用此模式補充可用答案。knowledge_used=true，且必須清楚標示未由本次資料庫直接驗證的部分。不要因一般知識缺口而讓整題完全不回答。"""
             final_instruction = (
                 "這是 refinement 後的最終判斷。"
                 "若 evidence 只能支持部分答案，請使用 partial，"
@@ -1711,14 +1755,23 @@ A. question_requirement
 - mixed：同時包含上述兩種以上要求。
 
 B. evidence_directly_answers
-判斷目前 evidence 是否直接回答了使用者真正問的事項。
-- true：evidence 明確支持核心結論。
-- false：evidence 只有相近案例、一般背景、部分欄位、部分子問題，或只能間接推論。
-注意：『語意相關』不等於『直接支持答案』。
+判斷目前 evidence 是否「足以支持」使用者真正要求的核心答案，而不是要求 evidence 與題目逐字相同。
+- true：evidence 直接支持核心結論；或多筆 evidence 可以在不新增規則、條件、數值、例外、版本狀態或個案事實的前提下，安全組合出核心結論。
+- false：evidence 只有語意相關背景、不同問題的相近案例、僅覆蓋部分核心子項，或要得到核心結論仍必須自行新增 evidence 未提供的規則、條件、數值、例外、版本狀態或個案事實。
+重要：
+- 不要求 evidence 必須出現與使用者問題完全相同的句子。
+- 不要求一定存在完全相同案例才可 grounded。
+- 不得自行增加使用者沒有要求的「通用判定準則」、「完整操作流程」、「明確優先順序」、「額外比較規則」，再因 evidence 沒有這些額外內容而判 partial。
+- 「安全組合推論」可以視為 evidence 已支持；「需要模型自行創造新規則」才視為不足。
+- 但『語意相關』仍不等於『足以支持答案』。
 
 C. required_precision_supported
-判斷 evidence 是否支持到使用者要求的精確程度。
+判斷 evidence 是否支持到「使用者實際要求」的精確程度，不要自行提高精度門檻。
 - 若使用者問 exact code / exact field / exact class number，evidence 必須直接支持該確切值。
+- 只有在以下情況，才因年份／版本不足而判 required_precision_supported=false：
+  (1) 使用者明確詢問「現行、目前、最新版、最新修訂、截至某年、某版本」等版本／時效要求；或
+  (2) evidence 明確顯示不同年份／版本的規則可能不同，而且版本差異會實質影響答案。
+- 不得僅因 evidence 自己帶有年份，就把一個普通一般規則題自行提升成 current/latest 問題。
 - 若使用者問 current/latest，evidence 必須能證明其版本或時點足以代表目前/最新版；舊版資料不能自動推成現行版本仍相同。
 - 若問題包含多個子項，每個會影響核心答案的子項都必須有支持，不能因多數子項已找到就把整題視為充分。
 - 若特定個案的唯一結論仍依賴使用者未提供的實物、語言、版本、內容比重、來源位置、館藏政策、系統設定等事實，應視為不足。
@@ -1752,7 +1805,7 @@ D. unsupported_answer_aspects
    - 不要把僅僅相關、但仍不足以支持該部分結論的 evidence 放進 evidence_ids。
    - 系統會在 refinement 時保留這些已接受 evidence，因此這個欄位代表「已支持、可安全 carry-forward」的證據，而不是一般相關文件清單。
 6. grounded 時不要加入模型既有知識。
-7. knowledge_fallback 時，答案中必須出現「【模型知識補充｜未由本次資料庫直接驗證】」。若 evidence 有可確認部分，可先列「資料庫可確認」再補充。
+7. knowledge_fallback 時，答案中必須以「補充參考（未由目前資料庫直接驗證）：」清楚區隔非資料庫直接支持的內容。若 evidence 有可確認部分，必須先回答資料庫已支持的部分，再列補充參考。
 8. 逐一判斷每個 retrieval unit 是否已被 evidence 覆蓋。evidence 行首的 retrieval_units 表示該證據由哪些 unit 的檢索取得；這是 coverage 判斷的重要線索，但不是硬性限制，同一正式證據可安全支援多個 unit。
 9. 允許「多筆 evidence 的安全組合」：例如一筆說明特定 indicator/條件的意義，另一筆說明該欄位的一般使用規則；只要兩者沒有衝突，且組合後沒有新增 evidence 未寫出的條件，就可以共同支持答案。不要要求所有結論都必須逐字出現在同一個 atomic unit。
 10. 不得把「相關 evidence」誤當成「足以支持使用者要求精度的 evidence」。
@@ -1760,8 +1813,9 @@ D. unsupported_answer_aspects
    - 若 question_requirement=current_latest，舊版、舊答覆或未標示時點的 evidence 不能自動證明現行最新版仍相同。
    - 若問題有多個子項，只要核心子項仍在 unsupported_answer_aspects 中，就不能把整題視為完整 grounded。
    - 若是 case_specific，其他案例的定案不能替代目前個案缺少的必要事實。
-11. refinement 是「補第一輪缺口」，不是重新忘記第一輪限制後從頭猜答案。
-   - 若第一輪 required_precision_supported=false，第二輪必須先檢查原 unsupported_answer_aspects 是否真的被新 evidence 解決。
+11. refinement 是「補第一輪真正必要的缺口」，不是把第一輪判斷機械式鎖死，也不是重新從頭猜答案。
+   - 第二輪先檢查第一輪 unsupported_answer_aspects 是否真的是使用者原問題要求；若只是第一輪 Judge 自行提高的額外要求，應取消該缺口。
+   - 對真正必要的缺口，再檢查是否已被新 evidence 直接或安全組合解決。
    - 未被解決時，不得僅因原答案再次出現在 evidence 中，就把 required_precision_supported 改成 true。
    - 對 current/latest/version 類問題尤其如此：2007 年版的正確答案只能證明 2007 年版，不能單獨證明現行最新版。
 
@@ -1777,12 +1831,27 @@ D. unsupported_answer_aspects
    - 未被 evidence 證明的 current/latest/version 狀態；
    - 使用者未提供、且只能由實物或館內情境確認的個案事實。
    對這些內容應明確標示仍無法由本次資料確定，而不是自行補成唯一答案。
-14. partial 的 refinement_query 只應描述仍未回答完整的 unit 及其 missing aspect；不要把已經有充分 evidence 的 unit 再混入 query，也不得把你猜測的答案值塞進搜尋詞。
+14. partial 的 refinement_query 必須是「missing-unit lexical query」，只描述仍未回答完整的 atomic requirement：
+   - 優先保留該 missing unit 的專有名詞、MARC tag、subfield、indicator、類號概念等必要 lexical anchors。
+   - 不要把已經有充分 evidence 的 unit 再混入 query。
+   - 不要把整個原問題重新複製進 refinement_query。
+   - 不得把你猜測的答案值塞進搜尋詞。
+   - 例：原題問「醫學手冊、家庭醫學手冊、通俗醫藥知識分別入哪號」，若前兩項已解決、只缺第三項，refinement_query 應類似「通俗醫藥知識 類號」，而不是重新搜尋整個原題。
 15. refinement_unit_ids：
    - status=partial 時，只列仍缺 evidence、需要第二輪檢索的 unit_id。
    - 已有充分 evidence 的 unit 不得列入，即使整題仍為 partial。
    - status=grounded 或 knowledge_fallback 時填空陣列。
 16. 回答使用繁體中文，直接回答館員問題，不輸出內部 reasoning。
+17. 使用者可見 answer 的呈現規則：
+   - 第一段先直接回答問題的結論，不要先描述檢索過程。
+   - 不得在 answer 中輸出 atomic_id、evidence_id、FAQ id、[Ref 1]、[23481_A01] 或其他內部參考編號。來源追溯只填在 JSON 的 evidence_ids 欄位。
+   - 不得輸出 grounded、partial、knowledge_fallback、retrieval unit、refinement、evidence 等內部系統狀態詞來解釋系統流程。
+   - 多子問題可以使用簡短條列；單一問題優先使用簡潔段落。
+   - grounded：直接給結論，再補必要理由或適用條件。
+   - partial：先以「目前可確認：」回答已被資料支持的部分；再以「尚無法確認：」說明真正仍缺的面向。不得因部分不足而隱藏已確認的答案。
+   - knowledge_fallback：先以「依目前資料庫可確認：」回答資料庫已支持的部分；非資料庫直接支持的內容另以「補充參考（未由目前資料庫直接驗證）：」區隔。
+   - 若資料庫出現不同格式、版本或時期的衝突，先給可在明確條件下成立的直接答案，再說明限制；不要把衝突自行解釋成未被資料證明的版本演進。
+   - 答案目標是讓編目館員可直接理解與採用，避免冗長重述題目。
 
 {final_instruction}
 """
@@ -1892,7 +1961,10 @@ D. unsupported_answer_aspects
             if allow_partial:
                 refinement_query = str(result.get("refinement_query", "")).strip()
                 if not refinement_query:
-                    refinement_query = f"{query} {missing}".strip()
+                    # V2-C4: fallback to the unresolved aspect only.  Re-attaching
+                    # the whole original question tends to reintroduce already
+                    # solved units and weakens missing-unit BM25 retrieval.
+                    refinement_query = missing or query
                 result["refinement_query"] = refinement_query
             else:
                 # Final partial: there is no third retrieval round.
@@ -1900,9 +1972,16 @@ D. unsupported_answer_aspects
 
         answer = str(result.get("answer", "")).strip()
         if result["status"] == "knowledge_fallback" and self.config.allow_model_knowledge_fallback:
-            marker = "【模型知識補充｜未由本次資料庫直接驗證】"
-            if marker not in answer:
-                answer = f"{marker}\n{answer}".strip()
+            public_marker = "補充參考（未由目前資料庫直接驗證）："
+            legacy_marker = "【模型知識補充｜未由本次資料庫直接驗證】"
+            if legacy_marker in answer:
+                answer = answer.replace(legacy_marker, public_marker)
+            if public_marker not in answer:
+                answer = f"{public_marker}\n{answer}".strip()
+
+        # Presentation-only cleanup: never expose internal citation labels in
+        # the librarian-facing answer.  Structured evidence_ids remain intact.
+        answer = self._sanitize_user_visible_answer(answer)
         result["answer"] = answer
         return result
 
